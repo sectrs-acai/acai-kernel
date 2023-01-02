@@ -357,6 +357,15 @@ config MMIOTRACE
 	  See Documentation/trace/mmiotrace.rst.
 	  If you are not helping to develop drivers, say N.
 
+config FAULTHOOK
+	bool "Userspace memory hooking"
+	help
+	  Faulthook allows a userspace application to be notified
+	  when a given processed accessed an address in its address space.
+	  The processed is unscheduled until the userspace application
+	  allowed the request.
+
+
 config ENABLE_DEFAULT_TRACERS
 	bool "Trace process context switches and events"
 	depends on !GENERIC_TRACER

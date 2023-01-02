@@ -30,7 +30,7 @@
 #include <asm/cpu_entry_area.h>		/* exception stack		*/
 #include <asm/pgtable_areas.h>		/* VMALLOC_START, ...		*/
 #include <asm/kvm_para.h>		/* kvm_handle_async_pf		*/
-
+#include <linux/faulthook.h>
 #define CREATE_TRACE_POINTS
 #include <asm/trace/exceptions.h>
 
@@ -45,6 +45,15 @@ kmmio_fault(struct pt_regs *regs, unsigned long addr)
 		if (kmmio_handler(regs, addr) == 1)
 			return -1;
 	return 0;
+}
+
+static nokprobe_inline int
+faulthook_fault(struct pt_regs *regs, unsigned long addr)
+{
+    if (unlikely(is_faulthook_active()))
+        if (faulthook_handler(regs, addr, current->pid) == 1)
+            return -1;
+    return 0;
 }
 
 /*
@@ -1428,6 +1437,10 @@ handle_page_fault(struct pt_regs *regs, unsigned long error_code,
 
 	if (unlikely(kmmio_fault(regs, address)))
 		return;
+
+    if (unlikely(faulthook_fault(regs, address))) {
+        return;
+    }
 
 	/* Was the fault on kernel-controlled part of the address space? */
 	if (unlikely(fault_in_kernel_space(address))) {

@@ -156,3 +156,7 @@ x509.genkey
 
 # Documentation toolchain
 sphinx_*/
+/vm.log
+/vm.pid
+/scripts/clang-tools/compile_commands.json
+/arch/x86/mm/kmmio_orig.c
