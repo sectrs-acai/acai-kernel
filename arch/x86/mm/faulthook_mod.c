@@ -55,8 +55,13 @@ struct module_ctx {
 	struct faulthook_probe *probe;
 	bool probe_active;
 
+	bool module_enabled;
+
 
 };
+/*
+ * TODO: Add locks
+ */
 
 struct module_ctx module_ctx;
 
@@ -79,6 +84,7 @@ static void pre_faulthook(struct faulthook_probe *p, struct pt_regs *regs,
 		return;
 	}
 
+	// We cant enable local interrupts: this leads to some weird stalls
 	// local_irq_enable();
 
 	/*
@@ -238,76 +244,6 @@ static long device_ioctl(struct file *file, unsigned int ioctl_num,
 	}
 }
 
-static int device_open(struct inode *inode, struct file *file)
-{
-	pr_info("device_open %d\n", current->pid);
-
-	if (module_ctx.device_busy == true) {
-		return -EBUSY;
-	}
-
-
-
-	module_ctx.device_busy_pid = current->pid;
-	module_ctx.device_busy = true;
-	return 0;
-}
-
-static int device_release(struct inode *inode, struct file *file)
-{
-	pr_info("device_release %d\n", current->pid);
-
-	/*
-         * TODO: If a processed is killed
-         * or does not properly clean up we have no longer a valid pid
-         * but still an entry with a faulthook.
-         * this leads to inconstent state
-         *
-         * We have to properly clean up even if pid is dead.
-         */
-	module_ctx.device_busy = false;
-	module_ctx.device_busy_pid = -1;
-
-	if (module_ctx.probe_active) {
-		unregister_probe();
-	}
-	return 0;
-}
-
-static const struct file_operations device_ops = { .owner = THIS_MODULE,
-						   .poll = device_poll,
-						   .unlocked_ioctl =
-							   device_ioctl,
-						   .open = device_open,
-						   .release = device_release };
-
-static int register_device(void)
-{
-	struct dentry *entry, *dir;
-	int ret = 0;
-
-	dir = debugfs_create_dir("faulthook", 0);
-	if (!dir) {
-		pr_alert("failed to create debugfs\n");
-		ret = 1;
-		goto clean_up;
-	}
-
-	entry = debugfs_create_file("hook", 0777, dir, &module_ctx,
-				    &device_ops);
-	if (!entry) {
-		pr_err("failed to create entry\n");
-		ret = 1;
-		goto clean_up;
-	}
-
-	module_ctx.debugfs_dir = dir;
-	return 0;
-
-clean_up:
-	debugfs_remove_recursive(dir);
-	return ret;
-}
 struct kprobe faulthook_kprobe;
 
 static int kprobe_pre_exit(struct kprobe *p, struct pt_regs *regs)
@@ -360,6 +296,97 @@ static void unregister_exit_krobe(void)
 	unregister_kprobe(&faulthook_kprobe);
 }
 
+
+static int device_open(struct inode *inode, struct file *file)
+{
+	pr_info("device_open %d\n", current->pid);
+
+	if (module_ctx.device_busy == true) {
+		return -EBUSY;
+	}
+
+	module_ctx.device_busy_pid = current->pid;
+	module_ctx.device_busy = true;
+
+	if (!module_ctx.module_enabled) {
+		pr_info("enabling module\n");
+		faulthook_init();
+		register_exit_kprobe();
+		module_ctx.module_enabled = 1;
+	}
+
+	return 0;
+}
+
+static int device_release(struct inode *inode, struct file *file)
+{
+	pr_info("device_release %d\n", current->pid);
+
+	/*
+         * TODO: If a processed is killed
+         * or does not properly clean up we have no longer a valid pid
+         * but still an entry with a faulthook.
+         * this leads to inconstent state
+         *
+         * We have to properly clean up even if pid is dead.
+         */
+
+	if (module_ctx.module_enabled) {
+		pr_info("disabling module\n");
+		unregister_exit_krobe();
+		faulthook_clean();
+		module_ctx.module_enabled = 0;
+	}
+
+
+	if (!module_ctx.device_busy) {
+		return 0;
+	}
+	module_ctx.device_busy = false;
+	module_ctx.device_busy_pid = -1;
+
+	if (module_ctx.probe_active) {
+		unregister_probe();
+	}
+
+	return 0;
+}
+
+static const struct file_operations device_ops = { .owner = THIS_MODULE,
+						   .poll = device_poll,
+						   .unlocked_ioctl =
+							   device_ioctl,
+						   .open = device_open,
+						   .release = device_release };
+
+static int register_device(void)
+{
+	struct dentry *entry, *dir;
+	int ret = 0;
+
+	dir = debugfs_create_dir("faulthook", 0);
+	if (!dir) {
+		pr_alert("failed to create debugfs\n");
+		ret = 1;
+		goto clean_up;
+	}
+
+	entry = debugfs_create_file("hook", 0777, dir, &module_ctx,
+				    &device_ops);
+	if (!entry) {
+		pr_err("failed to create entry\n");
+		ret = 1;
+		goto clean_up;
+	}
+
+	module_ctx.debugfs_dir = dir;
+	return 0;
+
+clean_up:
+	debugfs_remove_recursive(dir);
+	return ret;
+}
+
 static __init int mod_init(void)
 {
 	pr_info("faulthook_mod_init\n");
@@ -371,9 +398,6 @@ static __init int mod_init(void)
 	init_waitqueue_head(&module_ctx.fault_waitq);
 	atomic_set(&module_ctx.fault_state, FAULT_STATE_INIT);
 
-	faulthook_init();
-	register_exit_kprobe();
-
 	if (register_device() != 0) {
 		return -1;
 	}
@@ -383,12 +407,11 @@ static __init int mod_init(void)
 static __exit void mod_exit(void)
 {
 	pr_info("faulthook_mod_exit\n");
-	if (module_ctx.probe_active) {
-		unregister_probe();
+	if (module_ctx.module_enabled) {
+		if (module_ctx.probe_active) {
+			unregister_probe();
+		}
 	}
-	faulthook_clean();
-	unregister_exit_krobe();
-
 	if (module_ctx.debugfs_dir) {
 		debugfs_remove_recursive(module_ctx.debugfs_dir);
 	}

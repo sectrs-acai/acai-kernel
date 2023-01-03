@@ -307,7 +307,7 @@ int faulthook_handler(struct pt_regs *regs, unsigned long addr, pid_t pid)
 
     page_base &= page_level_mask(l);
 
-    pr_info("faulthook_handler on cpu %d addr " PTR_FMT "\n", smp_processor_id(), addr);
+    // pr_info("faulthook_handler on cpu %d addr " PTR_FMT "\n", smp_processor_id(), addr);
 
     /*
      * Preemption is now disabled to prevent process switch during
@@ -379,7 +379,9 @@ int faulthook_handler(struct pt_regs *regs, unsigned long addr, pid_t pid)
     preempt_disable();
     rcu_read_lock();
 
-    // ctx->active++;
+#if 1
+    ctx->active++;
+#endif
     ctx->fpage = faultpage;
     ctx->probe = probe;
     ctx->saved_flags = (regs->flags & (X86_EFLAGS_TF | X86_EFLAGS_IF));
@@ -417,7 +419,7 @@ static int faulthook_post_handler(unsigned long condition, struct pt_regs *regs)
     int ret = 0;
     struct faulthook_context *ctx = this_cpu_ptr(&faulthook_ctx);
 
-#if 0
+#if 1
     if (!ctx->active) {
         /*
          * debug traps without an active context are due to either
@@ -443,8 +445,10 @@ static int faulthook_post_handler(unsigned long condition, struct pt_regs *regs)
     regs->flags |= ctx->saved_flags;
 
     /* These were acquired in faulthook_handler(). */
-    //ctx->active--;
-    //BUG_ON(ctx->active);
+#if 1
+    ctx->active--;
+    BUG_ON(ctx->active);
+#endif
     rcu_read_unlock();
     preempt_enable_no_resched();
 
@@ -786,6 +790,9 @@ int faulthook_init(void)
 {
     // Reset per cpu variables
     enter_uniprocessor();
+    struct faulthook_context *ctx = this_cpu_ptr(&faulthook_ctx);
+    memset(ctx, 0, sizeof(struct faulthook_context));
+
     leave_uniprocessor();
     int i;
     for (i = 0; i < FAULTHOOK_PAGE_TABLE_SIZE; i++) {
