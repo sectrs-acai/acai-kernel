@@ -44,6 +44,7 @@
 #include <linux/errno.h>
 #include <asm/debugreg.h>
 #include <linux/faulthook.h>
+#include <linux/cpu.h>
 
 #define FAULTHOOK_PAGE_HASH_BITS 4
 #define FAULTHOOK_PAGE_TABLE_SIZE (1 << FAULTHOOK_PAGE_HASH_BITS)
@@ -306,6 +307,8 @@ int faulthook_handler(struct pt_regs *regs, unsigned long addr, pid_t pid)
 
     page_base &= page_level_mask(l);
 
+    pr_info("faulthook_handler on cpu %d addr " PTR_FMT "\n", smp_processor_id(), addr);
+
     /*
      * Preemption is now disabled to prevent process switch during
      * single stepping. We can only handle one active faulthook trace
@@ -376,7 +379,7 @@ int faulthook_handler(struct pt_regs *regs, unsigned long addr, pid_t pid)
     preempt_disable();
     rcu_read_lock();
 
-    ctx->active++;
+    // ctx->active++;
     ctx->fpage = faultpage;
     ctx->probe = probe;
     ctx->saved_flags = (regs->flags & (X86_EFLAGS_TF | X86_EFLAGS_IF));
@@ -414,6 +417,7 @@ static int faulthook_post_handler(unsigned long condition, struct pt_regs *regs)
     int ret = 0;
     struct faulthook_context *ctx = this_cpu_ptr(&faulthook_ctx);
 
+#if 0
     if (!ctx->active) {
         /*
          * debug traps without an active context are due to either
@@ -424,6 +428,7 @@ static int faulthook_post_handler(unsigned long condition, struct pt_regs *regs)
                 smp_processor_id());
         goto out;
     }
+#endif
 
     if (ctx->probe && ctx->probe->post_handler)
         ctx->probe->post_handler(ctx->probe, condition, regs);
@@ -438,8 +443,8 @@ static int faulthook_post_handler(unsigned long condition, struct pt_regs *regs)
     regs->flags |= ctx->saved_flags;
 
     /* These were acquired in faulthook_handler(). */
-    ctx->active--;
-    BUG_ON(ctx->active);
+    //ctx->active--;
+    //BUG_ON(ctx->active);
     rcu_read_unlock();
     preempt_enable_no_resched();
 
@@ -590,6 +595,7 @@ static void rcu_free_fault_pages(struct rcu_head *head)
         f = next;
     }
     kfree(dr);
+    pr_info("rcu_free_fault_pages\n");
 }
 
 static void remove_fault_pages(struct rcu_head *head)
@@ -684,6 +690,7 @@ void unregister_faulthook_probe(struct faulthook_probe *p)
      * not find the respective faulthook_fault_page and determine it's not
      * a faulthook fault, when it actually is. This would lead to madness.
      */
+    pr_info("unregister end\n");
     call_rcu(&drelease->rcu, remove_fault_pages);
 }
 
@@ -711,11 +718,78 @@ static int die_notifier(struct notifier_block *nb, unsigned long val,
 
 static struct notifier_block nb_die = {.notifier_call = die_notifier};
 
+
+#ifdef CONFIG_HOTPLUG_CPU
+static cpumask_var_t downed_cpus;
+
+static void enter_uniprocessor(void)
+{
+	int cpu;
+	int err;
+
+	if (!cpumask_available(downed_cpus) &&
+	    !alloc_cpumask_var(&downed_cpus, GFP_KERNEL)) {
+		pr_notice("Failed to allocate mask\n");
+		goto out;
+	}
+
+	get_online_cpus();
+	cpumask_copy(downed_cpus, cpu_online_mask);
+	cpumask_clear_cpu(cpumask_first(cpu_online_mask), downed_cpus);
+	if (num_online_cpus() > 1)
+		pr_notice("Disabling non-boot CPUs...\n");
+	put_online_cpus();
+
+	for_each_cpu(cpu, downed_cpus) {
+		err = remove_cpu(cpu);
+		if (!err)
+			pr_info("CPU%d is down.\n", cpu);
+		else
+			pr_err("Error taking CPU%d down: %d\n", cpu, err);
+	}
+out:
+	if (num_online_cpus() > 1)
+		pr_warn("multiple CPUs still online, may miss events.\n");
+}
+
+static void leave_uniprocessor(void)
+{
+	int cpu;
+	int err;
+
+	if (!cpumask_available(downed_cpus) || cpumask_weight(downed_cpus) == 0)
+		return;
+	pr_notice("Re-enabling CPUs...\n");
+	for_each_cpu(cpu, downed_cpus) {
+		err = add_cpu(cpu);
+		if (!err)
+			pr_info("enabled CPU%d.\n", cpu);
+		else
+			pr_err("cannot re-enable CPU%d: %d\n", cpu, err);
+	}
+}
+
+#else /* !CONFIG_HOTPLUG_CPU */
+static void enter_uniprocessor(void)
+{
+    if (num_online_cpus() > 1)
+	pr_warn("multiple CPUs are online, may miss events. "
+		"Suggest booting with maxcpus=1 kernel argument.\n");
+}
+
+static void leave_uniprocessor(void)
+{
+}
+#endif
+
 int faulthook_init(void)
 {
+    // Reset per cpu variables
+    enter_uniprocessor();
+    leave_uniprocessor();
     int i;
     for (i = 0; i < FAULTHOOK_PAGE_TABLE_SIZE; i++) {
-        INIT_LIST_HEAD(&faulting_pages[i]);
+	INIT_LIST_HEAD(&faulting_pages[i]);
     }
 
     return register_die_notifier(&nb_die);
@@ -727,8 +801,51 @@ void faulthook_clean(void)
 
     unregister_die_notifier(&nb_die);
     for (i = 0; i < FAULTHOOK_PAGE_TABLE_SIZE; i++) {
-        WARN_ONCE(
-                !list_empty(&faulting_pages[i]), KERN_ERR
-                "faulthook_page_table not empty at cleanup, any further tracing will leak memory.\n");
+	WARN_ONCE(
+		!list_empty(&faulting_pages[i]), KERN_ERR
+		"faulthook_page_table not empty at cleanup, any further tracing will leak memory.\n");
     }
 }
+
+
+#if 0
+struct kprobe faulthook_kprobe;
+static int kprobe_pre_exit(struct kprobe *p, struct pt_regs *regs)
+{
+    int i;
+    struct faulthook_page *f;
+    struct list_head *head;
+
+    for (i = 0; i < FAULTHOOK_PAGE_TABLE_SIZE; i++) {
+        head = &faulting_pages[i];
+        list_for_each_entry_rcu (f, head, list) {
+            if (f->pid == current->pid) {
+                pr_info("pid %d exists while still having faulthook registered. Cleaning up.\n",
+                        f->pid);
+                unregister_faulthook_probe(f);
+                synchronize_rcu();
+            }
+        }
+    }
+    return 0;
+}
+
+static int register_exit_kprobe(void) {
+    int ret = 0;
+    memset(&faulthook_kprobe, 0, sizeof(faulthook_kprobe));
+    faulthook_kprobe.pre_handler = kprobe_pre_exit;
+    faulthook_kprobe.symbol_name = "do_exit";
+    ret = register_kprobe(&faulthook_kprobe);
+
+    if (ret!=0) {
+        pr_err("Kprobe register for faulthook failed. "
+               "Faulting processes may leave inconsistent state!\n");
+    }
+    return ret;
+}
+
+static void unregister_exit_krobe(void) {
+    unregister_kprobe(&faulthook_kprobe);
+}
+
+#endif
