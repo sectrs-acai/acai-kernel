@@ -130,6 +130,7 @@ static int register_probe(pid_t pid,
 		pr_err("register_faulthook_probe failed\n");
 		return ret;
 	}
+
 	*ret_probe = probe;
 	return 0;
 }

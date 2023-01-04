@@ -45,7 +45,8 @@
 #include <asm/debugreg.h>
 #include <linux/faulthook.h>
 #include <linux/cpu.h>
-
+#include <linux/random.h>
+#include <linux/threads.h>
 #define FAULTHOOK_PAGE_HASH_BITS 4
 #define FAULTHOOK_PAGE_TABLE_SIZE (1 << FAULTHOOK_PAGE_HASH_BITS)
 #define PTR_FMT "0x%llx"
@@ -68,6 +69,21 @@ struct faulthook_page {
     int count;
 
     bool scheduled_for_release;
+
+    /*
+     * cpu id to which the faulthook is pinned.
+     * We only allow one active probe per cpu  */
+    int pinned_cpu_nr;
+
+    /*
+     * if this is 1, the core has to clean up its
+     * faulthook_context before writing to it.
+     * This is required if for some reason a faulthook process is
+     * killed midway without properly cleaning up its per-cpu
+     * faulthook_context.
+     * Clean up has to happen in faulthook_handler on pagefault.
+     */
+    bool cleanup_per_cpu_ctx;
 };
 
 struct faulthook_delayed_release {
@@ -109,6 +125,70 @@ static inline struct task_struct *get_task_by_pid(pid_t pid)
     return task;
 }
 
+#ifdef CONFIG_HOTPLUG_CPU
+static cpumask_var_t downed_cpus;
+
+static void enter_uniprocessor(void)
+{
+    int cpu;
+    int err;
+
+    if (!cpumask_available(downed_cpus) &&
+	!alloc_cpumask_var(&downed_cpus, GFP_KERNEL)) {
+	pr_notice("Failed to allocate mask\n");
+	goto out;
+    }
+
+    get_online_cpus();
+    cpumask_copy(downed_cpus, cpu_online_mask);
+    cpumask_clear_cpu(cpumask_first(cpu_online_mask), downed_cpus);
+    if (num_online_cpus() > 1)
+	pr_notice("Disabling non-boot CPUs...\n");
+    put_online_cpus();
+
+    for_each_cpu(cpu, downed_cpus) {
+	err = remove_cpu(cpu);
+	if (!err)
+	    pr_info("CPU%d is down.\n", cpu);
+	else
+	    pr_err("Error taking CPU%d down: %d\n", cpu, err);
+    }
+out:
+    if (num_online_cpus() > 1)
+	pr_warn("multiple CPUs still online, may miss events.\n");
+}
+
+static void leave_uniprocessor(void)
+{
+    int cpu;
+    int err;
+
+    if (!cpumask_available(downed_cpus) || cpumask_weight(downed_cpus) == 0)
+	return;
+    pr_notice("Re-enabling CPUs...\n");
+    for_each_cpu(cpu, downed_cpus) {
+	err = add_cpu(cpu);
+	if (!err)
+	    pr_info("enabled CPU%d.\n", cpu);
+	else
+	    pr_err("cannot re-enable CPU%d: %d\n", cpu, err);
+    }
+}
+
+#else /* !CONFIG_HOTPLUG_CPU */
+static void enter_uniprocessor(void)
+{
+    if (num_online_cpus() > 1)
+	pr_warn("multiple CPUs are online, may miss events. "
+		"Suggest booting with maxcpus=1 kernel argument.\n");
+}
+
+static void leave_uniprocessor(void)
+{
+}
+#endif
+
+
 static inline struct mm_struct *get_mm(size_t pid)
 {
     struct task_struct *task;
@@ -148,6 +228,7 @@ static struct list_head *faulthook_get_page_list(unsigned long addr, pid_t pid)
 
 /* Accessed per-cpu */
 static DEFINE_PER_CPU(struct faulthook_context, faulthook_ctx);
+static int cleanup_faulthook_ctx[NR_CPUS];
 
 /* Get the faulthook at this addr (if any). You must be holding RCU read lock. */
 static struct faulthook_probe *get_faulthook_probe(unsigned long addr,
@@ -331,6 +412,12 @@ int faulthook_handler(struct pt_regs *regs, unsigned long addr, pid_t pid)
     }
 
     ctx = this_cpu_ptr(&faulthook_ctx);
+
+    if (cleanup_faulthook_ctx[smp_processor_id()]) {
+	pr_info("Cleaning up per cpu ctx for cpu %d\n", smp_processor_id());
+	memset(ctx, 0, sizeof(struct faulthook_context));
+	cleanup_faulthook_ctx[smp_processor_id()] = 0;
+    }
     if (ctx->active) {
         if (page_base==ctx->addr) {
             /*
@@ -432,6 +519,7 @@ static int faulthook_post_handler(unsigned long condition, struct pt_regs *regs)
     }
 #endif
 
+    pr_info("Post handler for addr: " PTR_FMT, "\n", ctx->addr);
     if (ctx->probe && ctx->probe->post_handler)
         ctx->probe->post_handler(ctx->probe, condition, regs);
 
@@ -464,7 +552,7 @@ static int faulthook_post_handler(unsigned long condition, struct pt_regs *regs)
 }
 
 /* You must be holding faulthook_lock. */
-static int add_faulthook_page(unsigned long addr, pid_t pid)
+static int add_faulthook_page(unsigned long addr, pid_t pid, int pinned_cpu_nr)
 {
     struct faulthook_page *f;
     f = get_faulthook_page(addr, pid);
@@ -483,6 +571,7 @@ static int add_faulthook_page(unsigned long addr, pid_t pid)
     f->count = 1;
     f->addr = addr;
     f->pid = pid;
+    f->pinned_cpu_nr = pinned_cpu_nr;
 
     if (arm_page(f)) {
         kfree(f);
@@ -521,6 +610,34 @@ static int pin_pages(struct faulthook_probe *p)
 {
     // pin_user_pages_remote(get_mm(p->pid))
     return 0;
+}
+
+static void pin_pid_to_cpu(pid_t pid, int id)
+{
+#if 0
+    unsigned random_cpu;
+    get_random_bytes(&random_cpu, sizeof (random_cpu));
+    int cpu_id = random_cpu % num_active_cpus();
+#endif
+    int cpu_id = id;
+
+    char buf[100];
+    struct cpumask mask;
+    sched_getaffinity(pid, &mask);
+    cpumap_print_to_pagebuf(true, buf, &mask);
+    pr_info("affinity of pid %d mask: %s\n", pid, buf);
+
+    cpumask_clear(&mask);
+    cpumask_set_cpu(cpu_id, &mask);
+         pr_info("Pinning pid %d to CPU %d\n", pid, cpu_id);
+
+    pr_info("Pinning pid %d to CPU %d\n", pid, cpu_id);
+    long ret = sched_setaffinity(pid, &mask);
+    pr_info("sched_setaffinity returned: %ld\n", ret);
+}
+
+static void unpin_pid(pid_t pid) {
+ // TODO
 }
 
 /*
@@ -565,15 +682,45 @@ int register_faulthook_probe(struct faulthook_probe *p)
         goto out;
     }
 
+    // Reset per cpu variables
+    // enter_uniprocessor();
+    struct faulthook_context *ctx = this_cpu_ptr(&faulthook_ctx);
+    if (ctx->active > 0) {
+	pr_warn("core: %d\n", smp_processor_id());
+	pr_warn("Having another probe already in flight. "
+		"Other probe may no longer work!\n");
+    }
+    // memset(ctx, 0, sizeof(struct faulthook_context));
+
+    int pinned_core_id = 0;
+    pin_pid_to_cpu(p->pid, pinned_core_id);
+
+
+//    struct cpumask mask;
+//    sched_getaffinity(p->pid, &mask);
+//    cpumask_clear(&mask);
+//    //struct cpumask *mask_online = cpu_online_mask;
+//    // pr_info("Pinning pid %d to CPU %d\n", pid, cpu_id);
+//    char buf[100];
+//    cpumap_print_to_pagebuf(true, buf, mask_online);
+//    pr_info("online mask: %s\n", buf);
+//
+//    sched_setaffinity(p->pid, cpu_online_mask);
+
+
+
+    // leave_uniprocessor();
+
     faulthook_count++;
     list_add_rcu(&p->list, &faulthook_probes);
 
     while (size < size_lim) {
-        if (add_faulthook_page(addr + size, p->pid)) {
+        if (add_faulthook_page(addr + size, p->pid, pinned_core_id)) {
             pr_err("Unable to set page fault.\n");
         }
         size += page_level_size(l);
     }
+
     out:
     spin_unlock_irqrestore(&faulthook_lock, flags);
     /*
@@ -661,6 +808,17 @@ void unregister_faulthook_probe(struct faulthook_probe *p)
     }
 
     spin_lock_irqsave(&faulthook_lock, flags);
+
+
+    {
+	struct faulthook_page *f = get_faulthook_page(addr + size, p->pid);
+	if (f) {
+	    pr_info("marking release per cpu data for cpu %d\n", f->pinned_cpu_nr);
+	    cleanup_faulthook_ctx[f->pinned_cpu_nr] = 1;
+	}
+    }
+
+
     while (size < size_lim) {
         release_fault_page(addr + size, p->pid, &release_list);
         size += page_level_size(l);
@@ -679,6 +837,8 @@ void unregister_faulthook_probe(struct faulthook_probe *p)
         return;
     }
     drelease->release_list = release_list;
+
+
 
     /*
      * This is not really RCU here. We have just disarmed a set of
@@ -722,82 +882,14 @@ static int die_notifier(struct notifier_block *nb, unsigned long val,
 
 static struct notifier_block nb_die = {.notifier_call = die_notifier};
 
-
-#ifdef CONFIG_HOTPLUG_CPU
-static cpumask_var_t downed_cpus;
-
-static void enter_uniprocessor(void)
-{
-	int cpu;
-	int err;
-
-	if (!cpumask_available(downed_cpus) &&
-	    !alloc_cpumask_var(&downed_cpus, GFP_KERNEL)) {
-		pr_notice("Failed to allocate mask\n");
-		goto out;
-	}
-
-	get_online_cpus();
-	cpumask_copy(downed_cpus, cpu_online_mask);
-	cpumask_clear_cpu(cpumask_first(cpu_online_mask), downed_cpus);
-	if (num_online_cpus() > 1)
-		pr_notice("Disabling non-boot CPUs...\n");
-	put_online_cpus();
-
-	for_each_cpu(cpu, downed_cpus) {
-		err = remove_cpu(cpu);
-		if (!err)
-			pr_info("CPU%d is down.\n", cpu);
-		else
-			pr_err("Error taking CPU%d down: %d\n", cpu, err);
-	}
-out:
-	if (num_online_cpus() > 1)
-		pr_warn("multiple CPUs still online, may miss events.\n");
-}
-
-static void leave_uniprocessor(void)
-{
-	int cpu;
-	int err;
-
-	if (!cpumask_available(downed_cpus) || cpumask_weight(downed_cpus) == 0)
-		return;
-	pr_notice("Re-enabling CPUs...\n");
-	for_each_cpu(cpu, downed_cpus) {
-		err = add_cpu(cpu);
-		if (!err)
-			pr_info("enabled CPU%d.\n", cpu);
-		else
-			pr_err("cannot re-enable CPU%d: %d\n", cpu, err);
-	}
-}
-
-#else /* !CONFIG_HOTPLUG_CPU */
-static void enter_uniprocessor(void)
-{
-    if (num_online_cpus() > 1)
-	pr_warn("multiple CPUs are online, may miss events. "
-		"Suggest booting with maxcpus=1 kernel argument.\n");
-}
-
-static void leave_uniprocessor(void)
-{
-}
-#endif
-
 int faulthook_init(void)
 {
-    // Reset per cpu variables
-    enter_uniprocessor();
-    struct faulthook_context *ctx = this_cpu_ptr(&faulthook_ctx);
-    memset(ctx, 0, sizeof(struct faulthook_context));
-
-    leave_uniprocessor();
     int i;
     for (i = 0; i < FAULTHOOK_PAGE_TABLE_SIZE; i++) {
 	INIT_LIST_HEAD(&faulting_pages[i]);
     }
+
+    // memset(cleanup_faulthook_ctx, 0, sizeof(cleanup_faulthook_ctx));
 
     return register_die_notifier(&nb_die);
 }

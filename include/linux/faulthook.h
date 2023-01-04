@@ -27,6 +27,8 @@ struct faulthook_probe {
 	/* Called after addr is executed: */
 	faulthook_post_handler_t post_handler;
 
+	int pinned_cpu_id;
+
 	void			*private;
 };
 
