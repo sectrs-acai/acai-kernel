@@ -19,6 +19,7 @@ struct faulthook_probe {
 	/* start location of the probe point: */
 	unsigned long		addr;
 
+
 	pid_t                   pid;
 	/* length of the probe region: */
 	unsigned long		len;
@@ -27,7 +28,8 @@ struct faulthook_probe {
 	/* Called after addr is executed: */
 	faulthook_post_handler_t post_handler;
 
-	int pinned_cpu_id;
+	/* during probing we have to pin the pid to a single core */
+	int pin_to_core;
 
 	void			*private;
 };

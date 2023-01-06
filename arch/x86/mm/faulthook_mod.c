@@ -22,6 +22,7 @@ struct faulthook_ctrl {
 	bool active;
 	pid_t pid;
 	unsigned long address;
+	unsigned long len;
 };
 
 #define FAULTHOOK_IOCTL_MAGIC_NUMBER (long)0x3d18
@@ -83,7 +84,7 @@ static void pre_faulthook(struct faulthook_probe *p, struct pt_regs *regs,
 			addr, p->pid);
 		return;
 	}
-
+	pr_info("pre_faulthook on addr " PTR_FMT "\n", addr);
 	// We cant enable local interrupts: this leads to some weird stalls
 	// local_irq_enable();
 
@@ -105,6 +106,7 @@ static void pre_faulthook(struct faulthook_probe *p, struct pt_regs *regs,
 
 static int register_probe(pid_t pid,
 			  unsigned long address,
+			  unsigned long length,
 			  struct faulthook_probe **ret_probe)
 {
 	int ret;
@@ -119,9 +121,10 @@ static int register_probe(pid_t pid,
 	}
 
 	*probe = (struct faulthook_probe){ .addr = (unsigned long)address,
-					   .len = 4096,
+					   .len = length,
 					   .pre_handler = pre_faulthook,
 					   .pid = pid,
+					   .pin_to_core = 0,
 					   .private = &module_ctx };
 
 	ret = register_faulthook_probe(probe);
@@ -164,7 +167,7 @@ static __poll_t device_poll(struct file *filp,
 	    == FAULT_STATE_CONTINUE_USER_POLL) {
 		atomic_set(&module_ctx.fault_state,
 			   FAULT_STATE_USER_POLL_PROCESSED);
-
+		pr_info("device_poll has data\n");
 		mask |= POLLIN | POLLRDNORM;
 		return mask;
 
@@ -196,12 +199,15 @@ static long device_ioctl_cmd_status(struct file *file, unsigned int ioctl_num,
 			unregister_probe();
 		}
 
+		// TODO: More Sanitation
 		pid_t pid = usr.pid;
 		unsigned long address = usr.address;
+		unsigned long len = usr.len;
 		struct faulthook_probe *p = NULL;
 
 		int ret = register_probe(pid,
 					 address,
+					 len,
 					 &p);
 		if (ret != 0) {
 			pr_err("register_probe failed\n");
@@ -253,6 +259,7 @@ static int kprobe_pre_exit(struct kprobe *p, struct pt_regs *regs)
 	struct faulthook_page *f;
 	struct list_head *head;
 
+	#if 0
 	pr_info("probe_active: %d, "
 		"current pid: %d,"
 		"target_pid: %d, "
@@ -261,6 +268,7 @@ static int kprobe_pre_exit(struct kprobe *p, struct pt_regs *regs)
 		current->pid,
 		module_ctx.target_pid,
 		module_ctx.device_busy_pid);
+	#endif
 
 	if (current->pid == module_ctx.device_busy_pid) {
 		pr_warn("device driver pid %d "
