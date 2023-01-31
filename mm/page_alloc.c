@@ -1691,6 +1691,35 @@ void __meminit reserve_bootmem_region(phys_addr_t start, phys_addr_t end)
 	}
 }
 
+#ifdef CONFIG_FVP_ESCAPE
+/* initialize a page for given phy memory and poison it
+ * This is useful for fvp_escape mapping to exclude pages
+ * without host mappings */
+void __meminit poison_region(phys_addr_t start, phys_addr_t end)
+{
+	unsigned long start_pfn = PFN_DOWN(start);
+	unsigned long end_pfn = PFN_UP(end);
+
+	for (; start_pfn < end_pfn; start_pfn++) {
+		if (pfn_valid(start_pfn)) {
+			init_reserved_page(start_pfn);
+			struct page *page = pfn_to_page(start_pfn);
+
+			/* Avoid false-positive PageTail() */
+			INIT_LIST_HEAD(&page->lru);
+
+			/*
+			 * no need for atomic set_bit because the struct
+			 * page is not visible yet so nobody should
+			 * access it yet.
+			 */
+			SetPageHWPoison(page);
+		}
+	}
+}
+#endif
+
+
 static void __free_pages_ok(struct page *page, unsigned int order,
 			    fpi_t fpi_flags)
 {
@@ -1720,12 +1749,58 @@ static void __free_pages_ok(struct page *page, unsigned int order,
 	__count_vm_events(PGFREE, 1 << order);
 }
 
+#ifdef CONFIG_FVP_ESCAPE
+/* returns 1 if we found a poisoned page */
+static int __free_pages_core_poison_check(struct page *page, unsigned int order)
+{
+	unsigned int nr_pages = 1 << order;
+	struct page *p = page;
+	unsigned int loop;
+	unsigned int poisoned = 0;
+
+	prefetchw(p);
+	for (loop = 0; loop < (nr_pages - 1); loop++, p++) {
+		prefetchw(p + 1);
+		if (unlikely(PageHWPoison(p))) {
+			poisoned++;
+		}
+	}
+	if (unlikely(PageHWPoison(p))) {
+		poisoned++;
+	}
+
+	/*
+	 * fvp_escape:
+	 * This contains a page for which we likely do not have a page mapping.
+	 * Poison everything!
+	 */
+	if (unlikely(poisoned > 0)) {
+		p = page;
+		prefetchw(p);
+		for (loop = 0; loop < (nr_pages - 1); loop++, p++) {
+			prefetchw(p + 1);
+			SetPageHWPoison(p);
+		}
+	}
+	return poisoned > 0;
+}
+#endif
+
 void __free_pages_core(struct page *page, unsigned int order)
 {
 	unsigned int nr_pages = 1 << order;
 	struct page *p = page;
 	unsigned int loop;
 
+#ifdef CONFIG_FVP_ESCAPE
+	int ret = 0;
+	ret = __free_pages_core_poison_check(page, order);
+	if (unlikely(ret != 0)) {
+		pr_info("pfn %lx is poisoned. Keep it as is and do not free\n",
+			page_to_pfn(page));
+		return;
+	}
+#endif
 	/*
 	 * When initializing the memmap, __init_single_page() sets the refcount
 	 * of all pages to 1 ("allocated"/"not free"). We have to set the
@@ -2292,8 +2367,9 @@ void __init page_alloc_init_late(void)
 	buffer_init();
 
 	/* Discard memblock private memory */
-	memblock_discard();
-
+#ifndef CONFIG_FVP_ESCAPE
+	 memblock_discard();
+#endif
 	for_each_node_state(nid, N_MEMORY)
 		shuffle_free_memory(NODE_DATA(nid));
 

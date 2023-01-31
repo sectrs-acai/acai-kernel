@@ -2169,6 +2169,13 @@ endmenu # "Kernel Features"
 
 menu "Boot options"
 
+config FVP_ESCAPE
+	bool "This enables Arm cca FVP escape"
+	default n
+	help
+	  Escape linux to FVP userspace manager during boot to
+	  exchange pfn mappings
+
 config ARM64_ACPI_PARKING_PROTOCOL
 	bool "Enable support for the ARM64 ACPI parking protocol"
 	depends on ACPI
@@ -2262,6 +2269,7 @@ config ARCH_SUSPEND_POSSIBLE
 	def_bool y
 
 endmenu # "Power management options"
+
 
 menu "CPU Power Management"
 
