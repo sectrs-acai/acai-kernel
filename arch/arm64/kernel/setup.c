@@ -54,6 +54,7 @@
 #include <asm/efi.h>
 #include <asm/xen/hypervisor.h>
 #include <asm/mmu_context.h>
+#include <asm/trusted_periph/fvp_escape.h>
 
 static int num_standard_resources;
 static struct resource *standard_resources;
@@ -342,6 +343,9 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 
 	paging_init();
 
+#ifdef CONFIG_FVP_ESCAPE
+	init_fvp_escape();
+#endif
 	acpi_table_upgrade();
 
 	/* Parse the ACPI tables for possible boot-time configuration */

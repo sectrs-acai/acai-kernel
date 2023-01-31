@@ -2635,9 +2635,20 @@ extern void mem_init_print_info(void);
 
 extern void reserve_bootmem_region(phys_addr_t start, phys_addr_t end);
 
+#ifdef CONFIG_FVP_ESCAPE
+extern void poison_region(phys_addr_t start, phys_addr_t end);
+#else
+static inline void poison_region(phys_addr_t start, phys_addr_t end) { }
+#endif
+
 /* Free the reserved page into the buddy system, so it gets managed. */
 static inline void free_reserved_page(struct page *page)
 {
+#ifdef CONFIG_FVP_ESCAPE
+	/* fvp escape: we dont free these pages
+	 * as we dont have mappings for them */
+	return;
+#endif
 	ClearPageReserved(page);
 	init_page_count(page);
 	__free_page(page);
