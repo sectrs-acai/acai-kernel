@@ -23,6 +23,10 @@ struct faulthook_probe {
 	pid_t                   pid;
 	/* length of the probe region: */
 	unsigned long		len;
+
+	/* do not fault on read */
+	int allow_read;
+
 	/* Called before addr is executed: */
 	faulthook_pre_handler_t pre_handler;
 	/* Called after addr is executed: */

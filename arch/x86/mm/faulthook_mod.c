@@ -18,6 +18,13 @@
 #include <linux/entry-common.h>
 #include <linux/faulthook.h>
 
+/*
+ * WIP TODOs
+ * - Add proper locking
+ * - Input sanitation
+ * - Add option to register several hooks
+ */
+
 struct faulthook_ctrl {
 	bool active;
 	pid_t pid;
@@ -52,24 +59,16 @@ struct module_ctx {
 	uint64_t target_address;
 	int target_pid;
 
-
 	struct faulthook_probe *probe;
 	bool probe_active;
-
 	bool module_enabled;
-
-
 };
-/*
- * TODO: Add locks
- */
 
 struct module_ctx module_ctx;
-
-// static DEFINE_MUTEX(faulthook_mutex);
 static DEFINE_SPINLOCK(faulthook_lock);
 
-static inline void notify_continue_fault(void) {
+static inline void notify_continue_fault(void)
+{
 	atomic_set(&module_ctx.fault_state, FAULT_STATE_CONTINUE_FAULT);
 	wake_up(&module_ctx.fault_waitq);
 }
@@ -84,9 +83,8 @@ static void pre_faulthook(struct faulthook_probe *p, struct pt_regs *regs,
 			addr, p->pid);
 		return;
 	}
+
 	pr_info("pre_faulthook on addr " PTR_FMT "\n", addr);
-	// We cant enable local interrupts: this leads to some weird stalls
-	// local_irq_enable();
 
 	/*
 	 * Notify a polling userspace application to serve the fault
@@ -96,24 +94,20 @@ static void pre_faulthook(struct faulthook_probe *p, struct pt_regs *regs,
 
 	/*
 	 * Pause faulthook until userspace application served the request
-	 * */
+	 */
 	wait_event(module_ctx.fault_waitq,
 		   atomic_read(&module_ctx.fault_state) ==
 			   FAULT_STATE_CONTINUE_FAULT);
-
-	// local_irq_disable();
 }
 
-static int register_probe(pid_t pid,
-			  unsigned long address,
+static int register_probe(pid_t pid, unsigned long address,
 			  unsigned long length,
 			  struct faulthook_probe **ret_probe)
 {
 	int ret;
 
 	struct faulthook_probe *probe =
-		kmalloc(sizeof(struct faulthook_probe),
-			GFP_KERNEL);
+		kmalloc(sizeof(struct faulthook_probe), GFP_KERNEL);
 
 	if (!probe) {
 		pr_err("kmalloc failed in ioremap\n");
@@ -124,6 +118,7 @@ static int register_probe(pid_t pid,
 					   .len = length,
 					   .pre_handler = pre_faulthook,
 					   .pid = pid,
+					   .allow_read = 1,
 					   .pin_to_core = 0,
 					   .private = &module_ctx };
 
@@ -157,14 +152,13 @@ static int unregister_probe(void)
 	return 0;
 }
 
-static __poll_t device_poll(struct file *filp,
-			    struct poll_table_struct *wait)
+static __poll_t device_poll(struct file *filp, struct poll_table_struct *wait)
 {
 	__poll_t mask = 0;
 	poll_wait(filp, &module_ctx.poll_waitq, wait);
 
-	if (atomic_read(&module_ctx.fault_state)
-	    == FAULT_STATE_CONTINUE_USER_POLL) {
+	if (atomic_read(&module_ctx.fault_state) ==
+	    FAULT_STATE_CONTINUE_USER_POLL) {
 		atomic_set(&module_ctx.fault_state,
 			   FAULT_STATE_USER_POLL_PROCESSED);
 		pr_info("device_poll has data\n");
@@ -185,8 +179,7 @@ static long device_ioctl_cmd_status(struct file *file, unsigned int ioctl_num,
 
 	struct faulthook_ctrl usr;
 
-	ret = copy_from_user(&usr,
-			     (void *)ioctl_param,
+	ret = copy_from_user(&usr, (void *)ioctl_param,
 			     sizeof(struct faulthook_ctrl));
 	if (ret) {
 		pr_info("copy_from_user failed\n");
@@ -205,10 +198,7 @@ static long device_ioctl_cmd_status(struct file *file, unsigned int ioctl_num,
 		unsigned long len = usr.len;
 		struct faulthook_probe *p = NULL;
 
-		int ret = register_probe(pid,
-					 address,
-					 len,
-					 &p);
+		int ret = register_probe(pid, address, len, &p);
 		if (ret != 0) {
 			pr_err("register_probe failed\n");
 			return -EFAULT;
@@ -259,17 +249,6 @@ static int kprobe_pre_exit(struct kprobe *p, struct pt_regs *regs)
 	struct faulthook_page *f;
 	struct list_head *head;
 
-	#if 0
-	pr_info("probe_active: %d, "
-		"current pid: %d,"
-		"target_pid: %d, "
-		"device_pid: %d\n",
-		module_ctx.probe_active,
-		current->pid,
-		module_ctx.target_pid,
-		module_ctx.device_busy_pid);
-	#endif
-
 	if (current->pid == module_ctx.device_busy_pid) {
 		pr_warn("device driver pid %d "
 			"did not release device on exit. cleaning up\n",
@@ -278,7 +257,7 @@ static int kprobe_pre_exit(struct kprobe *p, struct pt_regs *regs)
 		module_ctx.device_busy_pid = -1;
 		module_ctx.device_busy = false;
 
-	} else if (current->pid ==  module_ctx.target_pid) {
+	} else if (current->pid == module_ctx.target_pid) {
 		pr_warn("target %d dies cleaning up\n", current->pid);
 		unregister_probe();
 	}
@@ -305,7 +284,6 @@ static void unregister_exit_krobe(void)
 	unregister_kprobe(&faulthook_kprobe);
 }
 
-
 static int device_open(struct inode *inode, struct file *file)
 {
 	pr_info("device_open %d\n", current->pid);
@@ -331,22 +309,12 @@ static int device_release(struct inode *inode, struct file *file)
 {
 	pr_info("device_release %d\n", current->pid);
 
-	/*
-         * TODO: If a processed is killed
-         * or does not properly clean up we have no longer a valid pid
-         * but still an entry with a faulthook.
-         * this leads to inconstent state
-         *
-         * We have to properly clean up even if pid is dead.
-         */
-
 	if (module_ctx.module_enabled) {
 		pr_info("disabling module\n");
 		unregister_exit_krobe();
 		faulthook_clean();
 		module_ctx.module_enabled = 0;
 	}
-
 
 	if (!module_ctx.device_busy) {
 		return 0;
@@ -361,12 +329,13 @@ static int device_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static const struct file_operations device_ops = { .owner = THIS_MODULE,
-						   .poll = device_poll,
-						   .unlocked_ioctl =
-							   device_ioctl,
-						   .open = device_open,
-						   .release = device_release };
+static const struct file_operations
+	device_ops = {
+	.owner = THIS_MODULE,
+	.poll = device_poll,
+	.unlocked_ioctl = device_ioctl,
+	.open = device_open,
+	.release = device_release };
 
 static int register_device(void)
 {

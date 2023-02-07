@@ -49,7 +49,7 @@
 #include <linux/threads.h>
 #define FAULTHOOK_PAGE_HASH_BITS 4
 #define FAULTHOOK_PAGE_TABLE_SIZE (1 << FAULTHOOK_PAGE_HASH_BITS)
-#define PTR_FMT "0x%llx"
+#define PTR_FMT "0x%lx"
 
 struct faulthook_page {
 	struct list_head list;
@@ -57,6 +57,7 @@ struct faulthook_page {
 	unsigned long addr; /* the requested address, base addr of page */
 	unsigned long len; /* the requested address */
 	pteval_t old_presence; /* page presence prior to arming */
+	bool allow_read;
 	bool armed;
 
 	pid_t pid;
@@ -229,7 +230,7 @@ static struct faulthook_page *get_faulthook_page(unsigned long addr, pid_t pid)
 	pte_t *pte = lookup_address_in_mm(get_mm(pid), addr, &l);
 
 	if (!pte) {
-		pr_warn("no pte found for addr " PTR_FMT "in pid %d\n", addr,
+		pr_warn("no pte found for addr 0x%lx in pid %d\n", addr,
 			pid);
 		return NULL;
 	}
@@ -246,34 +247,54 @@ static struct faulthook_page *get_faulthook_page(unsigned long addr, pid_t pid)
 	return NULL;
 }
 
-static void clear_pmd_presence(pmd_t *pmd, bool clear, pmdval_t *old)
+static void clear_pmd_presence(pmd_t *pmd, bool clear, pmdval_t *old, bool allow_read)
 {
 	pmd_t new_pmd;
 	pmdval_t v = pmd_val(*pmd);
-	if (clear) {
+	if (allow_read) {
 		*old = v;
-		new_pmd = pmd_mkinvalid(*pmd);
+		if (clear) {
+			new_pmd = pfn_pmd(pmd_pfn(*pmd),
+				       __pgprot(pmd_flags(*pmd) & ~(_PAGE_RW)));
+		} else {
+			new_pmd = pfn_pmd(pmd_pfn(*pmd),
+					  __pgprot(pmd_flags(*pmd) | (_PAGE_RW)));
+		}
 	} else {
-		/* Presume this has been called with clear==true previously */
-		new_pmd = __pmd(*old);
+		if (clear) {
+			*old = v;
+			new_pmd = pmd_mkinvalid(*pmd);
+		} else {
+			/* Presume this has been called with clear==true previously */
+			new_pmd = __pmd(*old);
+		}
 	}
 	set_pmd(pmd, new_pmd);
 }
 
-static void clear_pte_presence(pte_t *pte, bool clear, pteval_t *old)
+static void clear_pte_presence(pte_t *pte, bool clear, pteval_t *old, bool allow_read)
 {
 	pteval_t v = pte_val(*pte);
-	if (clear) {
+	if (allow_read) {
 		*old = v;
-		/* Nothing should care about address */
-		pte_clear(&init_mm, 0, pte);
+		if (clear) {
+			set_pte_atomic(pte, __pte(v & (~_PAGE_RW)));
+		} else {
+			set_pte_atomic(pte, __pte(v | _PAGE_RW));
+		}
 	} else {
-		/* Presume this has been called with clear==true previously */
-		set_pte_atomic(pte, __pte(*old));
+		if (clear) {
+			*old = v;
+			/* Nothing should care about address */
+			pte_clear(&init_mm, 0, pte);
+		} else {
+			/* Presume this has been called with clear==true previously */
+			set_pte_atomic(pte, __pte(*old));
+		}
 	}
 }
 
-static int clear_page_presence(struct faulthook_page *f, bool clear)
+static int clear_page_presence(struct faulthook_page *f, bool clear, bool allow_read)
 {
 	unsigned int level;
 	pte_t *pte = lookup_address_in_mm(get_mm(f->pid), f->addr, &level);
@@ -285,10 +306,10 @@ static int clear_page_presence(struct faulthook_page *f, bool clear)
 
 	switch (level) {
 	case PG_LEVEL_2M:
-		clear_pmd_presence((pmd_t *)pte, clear, &f->old_presence);
+		clear_pmd_presence((pmd_t *)pte, clear, &f->old_presence, allow_read);
 		break;
 	case PG_LEVEL_4K:
-		clear_pte_presence(pte, clear, &f->old_presence);
+        clear_pte_presence(pte, clear, &f->old_presence, allow_read);
 		break;
 	default:
 		pr_err("unexpected page level 0x%x.\n", level);
@@ -314,12 +335,12 @@ static int arm_page(struct faulthook_page *f)
 {
 	int ret;
 	WARN_ONCE(f->armed, KERN_ERR pr_fmt("faulthook page already armed.\n"));
-	pr_info("arming page: " PTR_FMT "\n", f->addr);
+	pr_info("arming page: 0x%lx \n", f->addr);
 	if (f->armed) {
 		pr_warn("double-arm: addr 0x%08lx, ref %d, old %d\n", f->addr,
 			f->count, !!f->old_presence);
 	}
-	ret = clear_page_presence(f, true);
+	ret = clear_page_presence(f, true, f->allow_read);
 	WARN_ONCE(ret < 0,
 		  KERN_ERR pr_fmt("arming at 0x%08lx failed, pid %d\n"),
 		  f->addr, f->pid);
@@ -330,8 +351,9 @@ static int arm_page(struct faulthook_page *f)
 /** Restore the given page to saved presence state. */
 static void disarm_page(struct faulthook_page *f)
 {
-	pr_info("disarming page: " PTR_FMT "\n", f->addr);
-	int ret = clear_page_presence(f, false);
+	int ret;
+	pr_info("disarming page: 0x%lx \n", f->addr);
+	ret = clear_page_presence(f, false, f->allow_read);
 	WARN_ONCE(ret < 0, KERN_ERR "faulthook disarming at 0x%08lx failed.\n",
 		  f->addr);
 	f->armed = false;
@@ -425,8 +447,6 @@ int faulthook_handler(struct pt_regs *regs, unsigned long addr, pid_t pid)
 		}
 		goto no_faulthook;
 	}
-	// pr_info("disarming page " PTR_FMT " on pagefault of " PTR_FMT "\n",
-	// 	faultpage->addr, addr);
 
 	/* Now we set present bit */
 	disarm_page(faultpage);
@@ -525,14 +545,15 @@ out:
 }
 
 /* You must be holding faulthook_lock. */
-static int add_faulthook_page(unsigned long addr, pid_t pid, int pinned_cpu_nr)
+static int add_faulthook_page(unsigned long addr, pid_t pid, int pinned_cpu_nr,
+			      int allow_read)
 {
 	struct faulthook_page *f;
 	unsigned int l;
 	pte_t *pte = lookup_address_in_mm(get_mm(pid), addr, &l);
 
 	if (!pte) {
-		pr_info("no pte found for" PTR_FMT "in pid %d\n", addr, pid);
+		pr_info("no pte found for 0x%lx in pid %d\n", addr, pid);
 		return 0;
 	}
 	f = get_faulthook_page(addr, pid);
@@ -555,6 +576,7 @@ static int add_faulthook_page(unsigned long addr, pid_t pid, int pinned_cpu_nr)
 	f->addr = addr;
 	f->pid = pid;
 	f->pinned_cpu_nr = pinned_cpu_nr;
+	f->allow_read = allow_read;
 
 	if (arm_page(f)) {
 		kfree(f);
@@ -588,12 +610,6 @@ static void release_fault_page(unsigned long addr, pid_t pid,
 	}
 }
 
-static int pin_pages(struct faulthook_probe *p)
-{
-	// pin_user_pages_remote(get_mm(p->pid))
-	return 0;
-}
-
 static long pin_to_core(pid_t pid, int cpu_id)
 {
 	char buf[100];
@@ -608,11 +624,6 @@ static long pin_to_core(pid_t pid, int cpu_id)
 	return sched_setaffinity(pid, &mask);
 }
 
-static void unpin_pid(pid_t pid)
-{
-	// TODO
-}
-
 int register_faulthook_probe(struct faulthook_probe *p)
 {
 	unsigned long flags;
@@ -624,8 +635,7 @@ int register_faulthook_probe(struct faulthook_probe *p)
 	unsigned int l;
 	pte_t *pte;
 
-	pr_info("registering faulthook trace " PTR_FMT " (page " PTR_FMT
-		", length %d) for pid %d\n",
+	pr_info("registering faulthook trace 0x%lx (page 0x%lx, length %lx) for pid %d\n",
 		p->addr, base_addr, p->len, p->pid);
 
 	spin_lock_irqsave(&faulthook_lock, flags);
@@ -640,7 +650,7 @@ int register_faulthook_probe(struct faulthook_probe *p)
 
 	pte = lookup_address_in_mm(get_mm(p->pid), addr, &l);
 	if (!pte) {
-		pr_info(PTR_FMT "not found in pid %d\n", addr, p->pid);
+		pr_info("0x%lx not found in pid %d\n", addr, p->pid);
 		ret = -EINVAL;
 		goto out;
 	}
@@ -654,7 +664,7 @@ int register_faulthook_probe(struct faulthook_probe *p)
 
 	while (size < size_lim) {
 		if (add_faulthook_page(base_addr + size, p->pid,
-				       p->pin_to_core)) {
+				       p->pin_to_core, p->allow_read)) {
 			pr_err("Unable to set page fault.\n");
 		}
 		size += page_level_size(l);
@@ -733,11 +743,11 @@ void unregister_faulthook_probe(struct faulthook_probe *p)
 	struct faulthook_delayed_release *drelease;
 	unsigned int l;
 	pte_t *pte;
-	pr_info("unregistering trace 0x%llx for pid %d\n", p->addr, p->pid);
+	pr_info("unregistering trace 0x%lx for pid %d\n", p->addr, p->pid);
 
 	pte = lookup_address_in_mm(get_mm(p->pid), addr, &l);
 	if (!pte) {
-		pr_err("addr " PTR_FMT " not found in pid %d\n", p->addr,
+		pr_err("addr 0x%lx not found in pid %x\n", p->addr,
 		       p->pid);
 		return;
 	}
