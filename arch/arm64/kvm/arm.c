@@ -997,10 +997,14 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
 		trace_kvm_entry(*vcpu_pc(vcpu));
 		guest_timing_enter_irqoff();
 
-		if (vcpu_is_rec(vcpu))
+		if (vcpu_is_rec(vcpu)){
 			ret = kvm_rec_enter(vcpu);
-		else
+			if (ret)
+				pr_err("kvm_rec_enter return %x",ret);
+		}
+		else{
 			ret = kvm_arm_vcpu_enter_exit(vcpu);
+		}
 
 		vcpu->mode = OUTSIDE_GUEST_MODE;
 		vcpu->stat.exits++;

@@ -222,6 +222,11 @@ struct rec_exit {
 			u64 pmu_intr_en;
 			u64 pmu_cntr_en;
 		};
+		struct {
+			u64 pa;
+			u64 va;
+			u32 sid;
+		};
 		u8 padding7[0x100];
 	};
 };
@@ -235,8 +240,12 @@ struct rec_run {
 #define RMI_EXIT_IRQ			0x01
 #define RMI_EXIT_FIQ			0x02
 #define RMI_EXIT_PSCI			0x03
-#define RMI_EXIT_RIPAS_CHANGE		0x04
+#define RMI_EXIT_RIPAS_CHANGE	0x04
 #define RMI_EXIT_HOST_CALL		0x05
 #define RMI_EXIT_SERROR			0x06
+
+#define RMI_DEV_MEM			0x0A
+#define RMI_TRIGGER_TESTENGINE	0x0C
+//#define RMI_EXIT_MAP_SMMU_PAGE	0x10
 
 #endif

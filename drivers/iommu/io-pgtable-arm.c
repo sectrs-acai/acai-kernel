@@ -9,6 +9,12 @@
 
 #define pr_fmt(fmt)	"arm-lpae io-pgtable: " fmt
 
+/* XXX: cant have tracing in benchmark */
+#undef WARN_ON
+#define WARN_ON(b) b
+
+#define pr_trace(...);
+
 #include <linux/atomic.h>
 #include <linux/bitops.h>
 #include <linux/io-pgtable.h>
@@ -17,6 +23,8 @@
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/dma-mapping.h>
+#include <linux/mm.h>
+
 
 #include <asm/barrier.h>
 
@@ -164,7 +172,10 @@ static arm_lpae_iopte paddr_to_iopte(phys_addr_t paddr,
 {
 	arm_lpae_iopte pte = paddr;
 
-	/* Of the bits which overlap, either 51:48 or 15:12 are always RES0 */
+	/* 
+	 * Of the bits which overlap, either 51:48 or 15:12 are always RES0 
+	 * WHY IS IT SHIFTED and ORed ???????????????? Ok I guess I know
+	*/
 	return (pte | (pte >> (48 - 12))) & ARM_LPAE_PTE_ADDR_MASK;
 }
 
@@ -196,7 +207,9 @@ static void *__arm_lpae_alloc_pages(size_t size, gfp_t gfp,
 	dma_addr_t dma;
 	void *pages;
 
-	VM_BUG_ON((gfp & __GFP_HIGHMEM));
+	VM_BUG_ON((gfp & __GFP_HIGHMEM)); 
+	pr_trace("smmuv3: __arm_lpae_alloc_pages (low level alloc call), cfg: %llx", (__u64)cfg);
+	//dump_stack();
 	p = alloc_pages_node(dev_to_node(dev), gfp | __GFP_ZERO, order);
 	if (!p)
 		return NULL;
@@ -264,6 +277,7 @@ static void __arm_lpae_init_pte(struct arm_lpae_io_pgtable *data,
 	size_t sz = ARM_LPAE_BLOCK_SIZE(lvl, data);
 	int i;
 
+	pr_trace("smmuv3: ilog2 %x, size: %lx, lvl %x",ilog2(sizeof(arm_lpae_iopte)), sz, lvl);
 	if (data->iop.fmt != ARM_MALI_LPAE && lvl == ARM_LPAE_MAX_LEVELS - 1)
 		pte |= ARM_LPAE_PTE_TYPE_PAGE;
 	else
@@ -281,29 +295,6 @@ static int arm_lpae_init_pte(struct arm_lpae_io_pgtable *data,
 			     arm_lpae_iopte prot, int lvl, int num_entries,
 			     arm_lpae_iopte *ptep)
 {
-	int i;
-
-	for (i = 0; i < num_entries; i++)
-		if (iopte_leaf(ptep[i], lvl, data->iop.fmt)) {
-			/* We require an unmap first */
-			WARN_ON(!selftest_running);
-			return -EEXIST;
-		} else if (iopte_type(ptep[i]) == ARM_LPAE_PTE_TYPE_TABLE) {
-			/*
-			 * We need to unmap and free the old table before
-			 * overwriting it with a block entry.
-			 */
-			arm_lpae_iopte *tblp;
-			size_t sz = ARM_LPAE_BLOCK_SIZE(lvl, data);
-
-			tblp = ptep - ARM_LPAE_LVL_IDX(iova, lvl, data);
-			if (__arm_lpae_unmap(data, NULL, iova + i * sz, sz, 1,
-					     lvl, tblp) != sz) {
-				WARN_ON(1);
-				return -EINVAL;
-			}
-		}
-
 	__arm_lpae_init_pte(data, paddr, prot, lvl, num_entries, ptep);
 	return 0;
 }
@@ -327,7 +318,9 @@ static arm_lpae_iopte arm_lpae_install_table(arm_lpae_iopte *table,
 	 */
 	dma_wmb();
 
+	pr_trace("smmuv3: install table, ptep: %llx |  curr: %llx | new: %llx",(__u64)ptep,(__u64)curr,(__u64)new);
 	old = cmpxchg64_relaxed(ptep, curr, new);
+	pr_trace("smmuv3: install table, ptep: %llx |  curr: %llx | new: %llx | old: %llx",(__u64)ptep,(__u64)curr,(__u64)new, (__u64)old);
 
 	if (cfg->coherent_walk || (old & ARM_LPAE_PTE_SW_SYNC))
 		return old;
@@ -340,10 +333,11 @@ static arm_lpae_iopte arm_lpae_install_table(arm_lpae_iopte *table,
 	return old;
 }
 
+
 static int __arm_lpae_map(struct arm_lpae_io_pgtable *data, unsigned long iova,
 			  phys_addr_t paddr, size_t size, size_t pgcount,
 			  arm_lpae_iopte prot, int lvl, arm_lpae_iopte *ptep,
-			  gfp_t gfp, size_t *mapped)
+			  gfp_t gfp, size_t *mapped, unsigned int sid)
 {
 	arm_lpae_iopte *cptep, pte;
 	size_t block_size = ARM_LPAE_BLOCK_SIZE(lvl, data);
@@ -353,30 +347,42 @@ static int __arm_lpae_map(struct arm_lpae_io_pgtable *data, unsigned long iova,
 
 	/* Find our entry at the current level */
 	map_idx_start = ARM_LPAE_LVL_IDX(iova, lvl, data);
+	// ptep is always the pointer to the top/bottom of the curren page table at level lvl.
+	// Get the idx.
 	ptep += map_idx_start;
+
+	pr_trace("smmuv3: __arm_lpae_map page on level: %x | iova: %lx | phys: %llx ",lvl,iova, paddr);
+	pr_trace("smmuv3: shift %x, mask %x",ARM_LPAE_LVL_SHIFT(lvl,data), (1 << ((data)->bits_per_level + ARM_LPAE_PGD_IDX(lvl,data))) - 1);
 
 	/* If we can install a leaf entry at this level, then do so */
 	if (size == block_size) {
+		pr_trace("smmuv3: trying to map entry at current level %x",lvl);
 		max_entries = ARM_LPAE_PTES_PER_TABLE(data) - map_idx_start;
 		num_entries = min_t(int, pgcount, max_entries);
 		ret = arm_lpae_init_pte(data, iova, paddr, prot, lvl, num_entries, ptep);
-		if (!ret)
+		if (!ret){
 			*mapped += num_entries * size;
-
+			pr_trace("smmuv3: map success, paddr: %llx | va: %lx | num_entries: %x", paddr, iova, num_entries);
+		}
 		return ret;
 	}
+	pr_trace("smmuv3: failed to map entry at current level %x, continue",lvl);
+
 
 	/* We can't allocate tables at the final level */
 	if (WARN_ON(lvl >= ARM_LPAE_MAX_LEVELS - 1))
 		return -EINVAL;
 
 	/* Grab a pointer to the next level */
+	// * Will call to EL3 here.
 	pte = READ_ONCE(*ptep);
 	if (!pte) {
+		// If there is no next level page allocated at the current idx
+		// we need to allocate a page.
 		cptep = __arm_lpae_alloc_pages(tblsz, gfp, cfg);
 		if (!cptep)
 			return -ENOMEM;
-
+		
 		pte = arm_lpae_install_table(cptep, ptep, 0, data);
 		if (pte)
 			__arm_lpae_free_pages(cptep, tblsz, cfg);
@@ -384,17 +390,21 @@ static int __arm_lpae_map(struct arm_lpae_io_pgtable *data, unsigned long iova,
 		__arm_lpae_sync_pte(ptep, 1, cfg);
 	}
 
+	// Check if page is iopte_leaf, if this is NOT the case, transform cptep to virtual????
+	// Usually pte is always 0, maybe if you do some alloc and dealloc buisness this changes
+	pr_trace("smmuv3: is_iopte_leaf: %d ",iopte_leaf(pte, lvl, data->iop.fmt));
+	// We can ignore this case in our implementation and error if it occurs
 	if (pte && !iopte_leaf(pte, lvl, data->iop.fmt)) {
 		cptep = iopte_deref(pte, data);
 	} else if (pte) {
-		/* We require an unmap first */
+		// We require an unmap first 
 		WARN_ON(!selftest_running);
 		return -EEXIST;
 	}
-
+	
 	/* Rinse, repeat */
 	return __arm_lpae_map(data, iova, paddr, size, pgcount, prot, lvl + 1,
-			      cptep, gfp, mapped);
+			      cptep, gfp, mapped, sid);
 }
 
 static arm_lpae_iopte arm_lpae_prot_to_pte(struct arm_lpae_io_pgtable *data,
@@ -461,6 +471,16 @@ static arm_lpae_iopte arm_lpae_prot_to_pte(struct arm_lpae_io_pgtable *data,
 	return pte;
 }
 
+
+// TODO: cleanup;  not clean to define it like this
+extern unsigned long get_sid_from_vttbr(unsigned long vttbr);
+
+// TODO: cleanup
+static inline struct io_pgtable *to_io_pgtable(struct io_pgtable_ops *dom)
+{
+	return container_of(dom, struct io_pgtable, ops);
+}
+
 static int arm_lpae_map_pages(struct io_pgtable_ops *ops, unsigned long iova,
 			      phys_addr_t paddr, size_t pgsize, size_t pgcount,
 			      int iommu_prot, gfp_t gfp, size_t *mapped)
@@ -470,8 +490,10 @@ static int arm_lpae_map_pages(struct io_pgtable_ops *ops, unsigned long iova,
 	arm_lpae_iopte *ptep = data->pgd;
 	int ret, lvl = data->start_level;
 	arm_lpae_iopte prot;
+	unsigned long sid;
 	long iaext = (s64)iova >> cfg->ias;
 
+	pr_trace("smmuv3: (io_pgtable_ops->map_pages) pagesize: %lx",pgsize);
 	if (WARN_ON(!pgsize || (pgsize & cfg->pgsize_bitmap) != pgsize))
 		return -EINVAL;
 
@@ -485,8 +507,19 @@ static int arm_lpae_map_pages(struct io_pgtable_ops *ops, unsigned long iova,
 		return 0;
 
 	prot = arm_lpae_prot_to_pte(data, iommu_prot);
+	// Modify __arm_lpae_map.
+
+	sid = to_io_pgtable(ops)->cfg.arm_lpae_s2_cfg.vttbr;
+	pr_trace("smmuv3: vttbr is %lx || prot is %llx",sid, prot);
+	// identify sid based on pgd (aka vttbr)
+	// O(n) in 
+	sid = get_sid_from_vttbr(sid);
+	pr_trace("smmuv3: sid is %lx",sid);
 	ret = __arm_lpae_map(data, iova, paddr, pgsize, pgcount, prot, lvl,
-			     ptep, gfp, mapped);
+			     ptep, gfp, mapped, sid);
+	if(!ret){
+		*mapped = pgsize * pgcount;
+	}
 	/*
 	 * Synchronise all PTE updates for the new mapping before there's
 	 * a chance for anything to kick off a table walk for the new iova.
@@ -801,6 +834,7 @@ arm_64_lpae_alloc_pgtable_s1(struct io_pgtable_cfg *cfg, void *cookie)
 	struct arm_lpae_io_pgtable *data;
 	typeof(&cfg->arm_lpae_s1_cfg.tcr) tcr = &cfg->arm_lpae_s1_cfg.tcr;
 	bool tg1;
+	pr_trace("smmuv3: alloc pgtable s1");
 
 	if (cfg->quirks & ~(IO_PGTABLE_QUIRK_ARM_NS |
 			    IO_PGTABLE_QUIRK_ARM_TTBR1 |
@@ -909,6 +943,7 @@ arm_64_lpae_alloc_pgtable_s2(struct io_pgtable_cfg *cfg, void *cookie)
 	if (cfg->quirks)
 		return NULL;
 
+	pr_trace("alloc pgtable s2");
 	data = arm_lpae_alloc_pgtable(cfg);
 	if (!data)
 		return NULL;
@@ -1282,7 +1317,7 @@ static int __init arm_lpae_do_selftests(void)
 		for (j = 0; j < ARRAY_SIZE(ias); ++j) {
 			cfg.pgsize_bitmap = pgsize[i];
 			cfg.ias = ias[j];
-			pr_info("selftest: pgsize_bitmap 0x%08lx, IAS %u\n",
+			pr_trace("selftest: pgsize_bitmap 0x%08lx, IAS %u\n",
 				pgsize[i], ias[j]);
 			if (arm_lpae_run_tests(&cfg))
 				fail++;
@@ -1291,7 +1326,7 @@ static int __init arm_lpae_do_selftests(void)
 		}
 	}
 
-	pr_info("selftest: completed with %d PASS %d FAIL\n", pass, fail);
+	pr_trace("selftest: completed with %d PASS %d FAIL\n", pass, fail);
 	return fail ? -EFAULT : 0;
 }
 subsys_initcall(arm_lpae_do_selftests);

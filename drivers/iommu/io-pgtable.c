@@ -51,10 +51,10 @@ struct io_pgtable_ops *alloc_io_pgtable_ops(enum io_pgtable_fmt fmt,
 	iop = fns->alloc(cfg, cookie);
 	if (!iop)
 		return NULL;
-
 	iop->fmt	= fmt;
 	iop->cookie	= cookie;
 	iop->cfg	= *cfg;
+	pr_info("smmuv3: allocated io_pgtable,  cfg: %llx | pgtable_alloc num: %x", (__u64)&(iop->cfg),fmt);
 
 	return &iop->ops;
 }

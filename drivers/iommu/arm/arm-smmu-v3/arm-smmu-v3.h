@@ -519,6 +519,7 @@ struct arm_smmu_ll_queue {
 };
 
 struct arm_smmu_queue {
+	// ll = low level queue
 	struct arm_smmu_ll_queue	llq;
 	int				irq; /* Wired interrupt */
 
@@ -592,6 +593,9 @@ struct arm_smmu_ctx_desc_cfg {
 };
 
 struct arm_smmu_s1_cfg {
+	// arm_smmu_ctx_desc holds the Linux kernel data,
+	// However, to be synced with the smmu it has to be written to 
+	// cdcfg->cdtab + ssid * CTXDESC_CD_DWORDS (so support multiple SID's)
 	struct arm_smmu_ctx_desc_cfg	cdcfg;
 	struct arm_smmu_ctx_desc	cd;
 	u8				s1fmt;
@@ -674,6 +678,10 @@ struct arm_smmu_device {
 
 	struct rb_root			streams;
 	struct mutex			streams_mutex;
+
+	unsigned int num_registered_devs;
+
+	resource_size_t ioaddr;
 };
 
 struct arm_smmu_stream {
@@ -736,6 +744,7 @@ static inline struct arm_smmu_domain *to_smmu_domain(struct iommu_domain *dom)
 extern struct xarray arm_smmu_asid_xa;
 extern struct mutex arm_smmu_asid_lock;
 extern struct arm_smmu_ctx_desc quiet_cd;
+extern void testengine_initcall(struct arm_smmu_domain *smmu_domain, struct arm_smmu_device *smmu);
 
 int arm_smmu_write_ctx_desc(struct arm_smmu_domain *smmu_domain, int ssid,
 			    struct arm_smmu_ctx_desc *cd);
