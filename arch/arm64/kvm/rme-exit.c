@@ -23,6 +23,32 @@ static int rec_exit_reason_notimpl(struct kvm_vcpu *vcpu)
 	return -ENXIO;
 }
 
+extern int map_pages_from_sid(unsigned int sid, unsigned long pa, unsigned long va, unsigned long num_pages);
+extern int execute_testengine_dma(unsigned int sid, unsigned long iova_src, unsigned long iova_dst);
+
+static int rec_dev_mem(struct kvm_vcpu *vcpu){
+	struct realm *realm = &vcpu->kvm->arch.realm;
+	struct rec *rec = &vcpu->arch.rec;
+	unsigned long pa = rec->run->exit.gprs[1];
+	unsigned long va = rec->run->exit.gprs[2];
+	int sid = rec->run->exit.gprs[3];
+
+	pr_info("calling map_pages_from_sid sid: %d, pa: %lx, va: %lx\n",sid,pa,va);
+
+	return map_pages_from_sid(sid, pa, va,1);
+}
+
+static int rec_trigger_testengine(struct kvm_vcpu *vcpu){
+	struct realm *realm = &vcpu->kvm->arch.realm;
+	struct rec *rec = &vcpu->arch.rec;
+	unsigned long iova_src = rec->run->exit.gprs[1];
+	unsigned long iova_dst = rec->run->exit.gprs[2];
+	unsigned long sid = rec->run->exit.gprs[3];
+
+	pr_info("calling rec_trigger_testengine sid: %ld, iova_src: %lx, iova_dst: %lx\n",sid,iova_src,iova_dst);
+	return execute_testengine_dma(sid,iova_src,iova_dst);
+}
+
 static int rec_exit_sync_dabt(struct kvm_vcpu *vcpu)
 {
 	struct rec *rec = &vcpu->arch.rec;
@@ -161,8 +187,15 @@ int handle_rme_exit(struct kvm_vcpu *vcpu, int rec_run_ret)
 		return 0;
 	}
 
-	if (rec_run_ret)
+	// TODO: This will be triggered once I make the RMI call
+	// TODO: Not sure why atm. 
+ 	if (rec_run_ret){
+		pr_err("rec_run_ret is %x\n",rec_run_ret);
+		pr_err("error status is %lx\n",status);
+		pr_err("return index is %lx\n",index);
+		pr_err("exit reason is %x\n",rec->run->exit.exit_reason);
 		return -ENXIO;
+	}
 
 	vcpu->arch.fault.esr_el2 = rec->run->exit.esr;
 	vcpu->arch.fault.far_el2 = rec->run->exit.far;
@@ -185,10 +218,17 @@ int handle_rme_exit(struct kvm_vcpu *vcpu, int rec_run_ret)
 		return rec_exit_ripas_change(vcpu);
 	case RMI_EXIT_HOST_CALL:
 		return rec_exit_host_call(vcpu);
+	case RMI_DEV_MEM:
+		pr_info("HANDLING RME_EXIT RMI_DEV_MEM\n");
+		return rec_dev_mem(vcpu);
+	case RMI_TRIGGER_TESTENGINE:
+		pr_info("HANDLING RME_EXIT RMI_TRIGGER_TESTENGINE\n");
+		return rec_trigger_testengine(vcpu);
 	}
 
-	kvm_pr_unimpl("Unsupported exit reason: %u\n",
+	pr_err("Unsupported exit reason: %u\n",
 		      rec->run->exit.exit_reason);
 	vcpu->run->exit_reason = KVM_EXIT_INTERNAL_ERROR;
+	//vcpu->run->exit_reason = KVM_EXIT_HYPERCALL;
 	return 0;
 }

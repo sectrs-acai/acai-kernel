@@ -129,4 +129,15 @@ struct realm_config {
  */
 #define SMC_RSI_HOST_CALL			SMC_RSI_FID(0x199)
 
+/*
+ * arg1 == IPA
+ * arg2 == delegate flag
+ * ret0 == Status / error
+ */
+#define SMC_RSI_DEV_MEM		                 SMC_RSI_FID(0x19A)
+
+#define SMC_CLAIM_DEVICE		                 SMC_RSI_FID(0x19B)
+
+#define SMC_TRIGGER_TESTENGINE		                 SMC_RSI_FID(0x19C)
+
 #endif /* __SMC_RSI_H_ */

@@ -457,6 +457,7 @@ struct kvm_cap_arm_rme_config_item {
 struct kvm_cap_arm_rme_populate_realm_args {
 	__u64 populate_ipa_base;
 	__u64 populate_ipa_size;
+	__u8 dev_attach;
 };
 
 struct kvm_cap_arm_rme_init_ipa_args {

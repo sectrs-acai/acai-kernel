@@ -8,6 +8,7 @@
  */
 
 #define pr_fmt(fmt)	"arm-lpae io-pgtable: " fmt
+#define pr_trace(...)
 
 #include <linux/atomic.h>
 #include <linux/bitops.h>
@@ -17,6 +18,10 @@
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/dma-mapping.h>
+#include <linux/arm-smccc.h>
+#include <linux/mm.h>
+#include <linux/arm-smccc.h>
+
 
 #include <asm/barrier.h>
 
@@ -25,6 +30,11 @@
 #define ARM_LPAE_MAX_ADDR_BITS		52
 #define ARM_LPAE_S2_MAX_CONCAT_PAGES	16
 #define ARM_LPAE_MAX_LEVELS		4
+
+#define SMC_DELEGATE_PAGE_TO_ROOT 0xc40001b5
+#define SMC_INIT_PTE	0xc40001b6
+#define SMC_INSTALL_TABLE	0xc40001b7
+#define RMM_GET_PTE 0xc40001b9
 
 /* Struct accessors */
 #define io_pgtable_to_data(x)						\
@@ -164,7 +174,10 @@ static arm_lpae_iopte paddr_to_iopte(phys_addr_t paddr,
 {
 	arm_lpae_iopte pte = paddr;
 
-	/* Of the bits which overlap, either 51:48 or 15:12 are always RES0 */
+	/* 
+	 * Of the bits which overlap, either 51:48 or 15:12 are always RES0 
+	 * WHY IS IT SHIFTED and ORed ???????????????? Ok I guess I know
+	*/
 	return (pte | (pte >> (48 - 12))) & ARM_LPAE_PTE_ADDR_MASK;
 }
 
@@ -196,7 +209,9 @@ static void *__arm_lpae_alloc_pages(size_t size, gfp_t gfp,
 	dma_addr_t dma;
 	void *pages;
 
-	VM_BUG_ON((gfp & __GFP_HIGHMEM));
+	VM_BUG_ON((gfp & __GFP_HIGHMEM)); 
+	pr_trace("smmuv3: __arm_lpae_alloc_pages (low level alloc call), cfg: %llx", (__u64)cfg);
+	//dump_stack();
 	p = alloc_pages_node(dev_to_node(dev), gfp | __GFP_ZERO, order);
 	if (!p)
 		return NULL;
@@ -264,6 +279,7 @@ static void __arm_lpae_init_pte(struct arm_lpae_io_pgtable *data,
 	size_t sz = ARM_LPAE_BLOCK_SIZE(lvl, data);
 	int i;
 
+	pr_trace("smmuv3: ilog2 %x, size: %lx, lvl %x",ilog2(sizeof(arm_lpae_iopte)), sz, lvl);
 	if (data->iop.fmt != ARM_MALI_LPAE && lvl == ARM_LPAE_MAX_LEVELS - 1)
 		pte |= ARM_LPAE_PTE_TYPE_PAGE;
 	else
@@ -285,6 +301,7 @@ static int arm_lpae_init_pte(struct arm_lpae_io_pgtable *data,
 
 	for (i = 0; i < num_entries; i++)
 		if (iopte_leaf(ptep[i], lvl, data->iop.fmt)) {
+			pr_trace("smmuv3: ------------------------------ if statement");
 			/* We require an unmap first */
 			WARN_ON(!selftest_running);
 			return -EEXIST;
@@ -295,6 +312,7 @@ static int arm_lpae_init_pte(struct arm_lpae_io_pgtable *data,
 			 */
 			arm_lpae_iopte *tblp;
 			size_t sz = ARM_LPAE_BLOCK_SIZE(lvl, data);
+			pr_trace("smmuv3: ------------------------------ else if statement");
 
 			tblp = ptep - ARM_LPAE_LVL_IDX(iova, lvl, data);
 			if (__arm_lpae_unmap(data, NULL, iova + i * sz, sz, 1,
@@ -303,6 +321,8 @@ static int arm_lpae_init_pte(struct arm_lpae_io_pgtable *data,
 				return -EINVAL;
 			}
 		}
+
+	pr_trace("smmuv3: ------------------------------ continue statement");
 
 	__arm_lpae_init_pte(data, paddr, prot, lvl, num_entries, ptep);
 	return 0;
@@ -327,7 +347,9 @@ static arm_lpae_iopte arm_lpae_install_table(arm_lpae_iopte *table,
 	 */
 	dma_wmb();
 
+	pr_trace("smmuv3: install table, ptep: %llx |  curr: %llx | new: %llx",(__u64)ptep,(__u64)curr,(__u64)new);
 	old = cmpxchg64_relaxed(ptep, curr, new);
+	pr_trace("smmuv3: install table, ptep: %llx |  curr: %llx | new: %llx | old: %llx",(__u64)ptep,(__u64)curr,(__u64)new, (__u64)old);
 
 	if (cfg->coherent_walk || (old & ARM_LPAE_PTE_SW_SYNC))
 		return old;
@@ -340,10 +362,68 @@ static arm_lpae_iopte arm_lpae_install_table(arm_lpae_iopte *table,
 	return old;
 }
 
+static unsigned long arm_lpae_init_pte_smc(struct arm_lpae_io_pgtable *data ,
+				 unsigned long iova, phys_addr_t paddr,
+			     arm_lpae_iopte prot, int lvl, int num_entries,
+			     arm_lpae_iopte *ptep, unsigned long sid)
+{
+	struct arm_smccc_1_2_regs smc_input;
+	struct arm_smccc_1_2_regs smc_output;
+	smc_input.a0 = SMC_INIT_PTE;
+	smc_input.a1 = num_entries;
+	smc_input.a2 = paddr;
+	smc_input.a3 = (__u64)virt_to_phys(ptep);
+	smc_input.a4 = lvl;
+	smc_input.a5 = data->bits_per_level;
+	smc_input.a6 = (__u64)prot;
+	smc_input.a7 = sid;
+	smc_input.a8 = iova;
+	arm_smccc_1_2_smc(&smc_input,&smc_output);
+	if (smc_output.a0){
+		pr_trace("smmuv3: smc call to root failed (arm_lpae_init_pte)");
+	}	
+	return smc_output.a0;
+}
+
+static unsigned long arm_lpae_install_table_smc(arm_lpae_iopte *table,
+					     arm_lpae_iopte *ptep, arm_lpae_iopte curr, 
+						 unsigned long sid, unsigned long iova){
+	struct arm_smccc_1_2_regs smc_input;
+	struct arm_smccc_1_2_regs smc_output;
+	// Modifies the paging structure, must be moved to ROOT
+	smc_input.a0 = SMC_INSTALL_TABLE;
+	smc_input.a1 = (__u64)virt_to_phys(table);
+	smc_input.a2 = (__u64)virt_to_phys(ptep);
+	smc_input.a3 = 0ULL;
+	smc_input.a4 = sid;
+	smc_input.a5 = iova;
+	arm_smccc_1_2_smc(&smc_input,&smc_output);
+	if (smc_output.a0){
+		pr_trace("smmuv3: smc call to root failed (arm_lpae_install_table)");
+	}
+	pr_trace("smmuv3: smc outout (SMC_INSTALL_TABLE) %lx",smc_output.a0);
+	return smc_output.a0;	
+}
+
+static unsigned long get_pte_entry_from_table_smc(arm_lpae_iopte *table){
+	struct arm_smccc_1_2_regs smc_input;
+	struct arm_smccc_1_2_regs smc_output;
+	// Modifies the paging structure, must be moved to ROOT
+	smc_input.a0 = RMM_GET_PTE;
+	smc_input.a1 = (__u64)virt_to_phys(table);
+	arm_smccc_1_2_smc(&smc_input,&smc_output);
+	if (!smc_output.a0){
+		pr_trace("smmuv3: smc call to root failed (get_pte_entry_from_table)");
+	}
+	pr_trace("smmuv3: smc outout (get_pte_entry_from_table) %lx",smc_output.a0);
+	return smc_output.a0;
+}
+
+
 static int __arm_lpae_map(struct arm_lpae_io_pgtable *data, unsigned long iova,
 			  phys_addr_t paddr, size_t size, size_t pgcount,
 			  arm_lpae_iopte prot, int lvl, arm_lpae_iopte *ptep,
-			  gfp_t gfp, size_t *mapped)
+			  gfp_t gfp, size_t *mapped, unsigned int sid)
 {
 	arm_lpae_iopte *cptep, pte;
 	size_t block_size = ARM_LPAE_BLOCK_SIZE(lvl, data);
@@ -353,48 +433,73 @@ static int __arm_lpae_map(struct arm_lpae_io_pgtable *data, unsigned long iova,
 
 	/* Find our entry at the current level */
 	map_idx_start = ARM_LPAE_LVL_IDX(iova, lvl, data);
+	// ptep is always the pointer to the top/bottom of the curren page table at level lvl.
+	// Get the idx.
 	ptep += map_idx_start;
+
+	pr_trace("smmuv3: __arm_lpae_map page on level: %x | iova: %lx | phys: %llx ",lvl,iova, paddr);
+	pr_trace("smmuv3: shift %x, mask %x",ARM_LPAE_LVL_SHIFT(lvl,data), (1 << ((data)->bits_per_level + ARM_LPAE_PGD_IDX(lvl,data))) - 1);
 
 	/* If we can install a leaf entry at this level, then do so */
 	if (size == block_size) {
+		pr_trace("smmuv3: trying to map entry at current level %x",lvl);
 		max_entries = ARM_LPAE_PTES_PER_TABLE(data) - map_idx_start;
 		num_entries = min_t(int, pgcount, max_entries);
-		ret = arm_lpae_init_pte(data, iova, paddr, prot, lvl, num_entries, ptep);
-		if (!ret)
+		// * Will call to EL3 here.
+		ret = arm_lpae_init_pte_smc(data, iova, paddr, prot, lvl, num_entries, ptep, sid);
+		//ret = arm_lpae_init_pte(data, iova, paddr, prot, lvl, num_entries, ptep);
+		if (!ret){
 			*mapped += num_entries * size;
-
+			pr_trace("smmuv3: map success, paddr: %llx | va: %lx | num_entries: %x", paddr, iova, num_entries);
+		}
+		
 		return ret;
+		ret = arm_lpae_init_pte(data, iova, paddr, prot, lvl, num_entries, ptep);
 	}
+	pr_trace("smmuv3: failed to map entry at current level %x, continue",lvl);
+
 
 	/* We can't allocate tables at the final level */
 	if (WARN_ON(lvl >= ARM_LPAE_MAX_LEVELS - 1))
 		return -EINVAL;
 
 	/* Grab a pointer to the next level */
-	pte = READ_ONCE(*ptep);
+	// * Will call to EL3 here.
+	pte = get_pte_entry_from_table_smc(ptep);
+	//pr_info("ptev3 SMC: %llx", pte);
+	//pte = READ_ONCE(*ptep);
+	//pr_info("ptev3 readonce: %llx", pte);
 	if (!pte) {
+		// If there is no next level page allocated at the current idx
+		// we need to allocate a page.
 		cptep = __arm_lpae_alloc_pages(tblsz, gfp, cfg);
 		if (!cptep)
 			return -ENOMEM;
-
-		pte = arm_lpae_install_table(cptep, ptep, 0, data);
+		
+		// * We will call to EL3 here.
+		pte = arm_lpae_install_table_smc(cptep, ptep, 0, sid, iova);
+		//pte = arm_lpae_install_table(cptep, ptep, 0, data);
 		if (pte)
 			__arm_lpae_free_pages(cptep, tblsz, cfg);
 	} else if (!cfg->coherent_walk && !(pte & ARM_LPAE_PTE_SW_SYNC)) {
 		__arm_lpae_sync_pte(ptep, 1, cfg);
 	}
 
+	// Check if page is iopte_leaf, if this is NOT the case, transform cptep to virtual????
+	// Usually pte is always 0, maybe if you do some alloc and dealloc buisness this changes
+	pr_trace("smmuv3: is_iopte_leaf: %d ",iopte_leaf(pte, lvl, data->iop.fmt));
+	// We can ignore this case in our implementation and error if it occurs
 	if (pte && !iopte_leaf(pte, lvl, data->iop.fmt)) {
 		cptep = iopte_deref(pte, data);
 	} else if (pte) {
-		/* We require an unmap first */
+		// We require an unmap first 
 		WARN_ON(!selftest_running);
 		return -EEXIST;
 	}
-
+	
 	/* Rinse, repeat */
 	return __arm_lpae_map(data, iova, paddr, size, pgcount, prot, lvl + 1,
-			      cptep, gfp, mapped);
+			      cptep, gfp, mapped, sid);
 }
 
 static arm_lpae_iopte arm_lpae_prot_to_pte(struct arm_lpae_io_pgtable *data,
@@ -461,6 +566,39 @@ static arm_lpae_iopte arm_lpae_prot_to_pte(struct arm_lpae_io_pgtable *data,
 	return pte;
 }
 
+
+// TODO: cleanup;  not clean to define it like this
+extern unsigned long get_sid_from_vttbr(unsigned long vttbr);
+
+// TODO: cleanup
+static inline struct io_pgtable *to_io_pgtable(struct io_pgtable_ops *dom)
+{
+	return container_of(dom, struct io_pgtable, ops);
+}
+
+#define SMC_MAP_PAGES	0xc40001bd
+
+static unsigned long map_pages_smc(unsigned long iova,
+			  unsigned long paddr, size_t pgcount,
+			  arm_lpae_iopte prot, arm_lpae_iopte *ptep,
+			  unsigned int sid){
+	struct arm_smccc_1_2_regs smc_input = {
+		.a0 = SMC_MAP_PAGES,
+		.a1 = iova,
+		.a2 = paddr,
+		.a3 = pgcount,
+		.a4 = prot,
+		.a5 = virt_to_phys(ptep),
+		.a6 = sid,
+	};
+	struct arm_smccc_1_2_regs smc_output;
+	arm_smccc_1_2_smc(&smc_input,&smc_output);
+	if (smc_output.a0){
+		pr_trace("smmuv3: smc call to root failed (map_pages_smc)");
+	}	
+	return smc_output.a0;
+}
+
 static int arm_lpae_map_pages(struct io_pgtable_ops *ops, unsigned long iova,
 			      phys_addr_t paddr, size_t pgsize, size_t pgcount,
 			      int iommu_prot, gfp_t gfp, size_t *mapped)
@@ -470,8 +608,10 @@ static int arm_lpae_map_pages(struct io_pgtable_ops *ops, unsigned long iova,
 	arm_lpae_iopte *ptep = data->pgd;
 	int ret, lvl = data->start_level;
 	arm_lpae_iopte prot;
+	unsigned long sid;
 	long iaext = (s64)iova >> cfg->ias;
 
+	pr_trace("smmuv3: (io_pgtable_ops->map_pages) pagesize: %lx",pgsize);
 	if (WARN_ON(!pgsize || (pgsize & cfg->pgsize_bitmap) != pgsize))
 		return -EINVAL;
 
@@ -485,8 +625,20 @@ static int arm_lpae_map_pages(struct io_pgtable_ops *ops, unsigned long iova,
 		return 0;
 
 	prot = arm_lpae_prot_to_pte(data, iommu_prot);
-	ret = __arm_lpae_map(data, iova, paddr, pgsize, pgcount, prot, lvl,
-			     ptep, gfp, mapped);
+	// Modify __arm_lpae_map.
+
+	sid = to_io_pgtable(ops)->cfg.arm_lpae_s2_cfg.vttbr;
+	pr_trace("smmuv3: vttbr is %lx || prot is %llx",sid, prot);
+	// identify sid based on pgd (aka vttbr)
+	// O(n) in 
+	sid = get_sid_from_vttbr(sid);
+	pr_trace("smmuv3: sid is %lx",sid);
+	ret = map_pages_smc(iova, paddr, pgcount, prot, ptep, sid);
+/* 	ret = __arm_lpae_map(data, iova, paddr, pgsize, pgcount, prot, lvl,
+			     ptep, gfp, mapped, sid); */
+	if(!ret){
+		*mapped = pgsize * pgcount;
+	}
 	/*
 	 * Synchronise all PTE updates for the new mapping before there's
 	 * a chance for anything to kick off a table walk for the new iova.
@@ -801,6 +953,7 @@ arm_64_lpae_alloc_pgtable_s1(struct io_pgtable_cfg *cfg, void *cookie)
 	struct arm_lpae_io_pgtable *data;
 	typeof(&cfg->arm_lpae_s1_cfg.tcr) tcr = &cfg->arm_lpae_s1_cfg.tcr;
 	bool tg1;
+	pr_trace("smmuv3: alloc pgtable s1");
 
 	if (cfg->quirks & ~(IO_PGTABLE_QUIRK_ARM_NS |
 			    IO_PGTABLE_QUIRK_ARM_TTBR1 |
@@ -903,12 +1056,15 @@ arm_64_lpae_alloc_pgtable_s2(struct io_pgtable_cfg *cfg, void *cookie)
 {
 	u64 sl;
 	struct arm_lpae_io_pgtable *data;
+	struct arm_smccc_1_2_regs smc_input;
+	struct arm_smccc_1_2_regs smc_output;
 	typeof(&cfg->arm_lpae_s2_cfg.vtcr) vtcr = &cfg->arm_lpae_s2_cfg.vtcr;
 
 	/* The NS quirk doesn't apply at stage 2 */
 	if (cfg->quirks)
 		return NULL;
 
+	pr_trace("alloc pgtable s2");
 	data = arm_lpae_alloc_pgtable(cfg);
 	if (!data)
 		return NULL;
@@ -988,6 +1144,17 @@ arm_64_lpae_alloc_pgtable_s2(struct io_pgtable_cfg *cfg, void *cookie)
 	if (!data->pgd)
 		goto out_free_data;
 
+	// TODO: delete it in the future, currently we need it
+	// TODO: if we don't flag the PGD as table, all subsequent mappings fail.
+	// Temporary for testing, will be moved once we have the 
+	// stream table transition logic in place (and set up).
+	pr_trace("smmuv3: moving s2 pdg to ROOT mem");
+	smc_input.a0 = SMC_DELEGATE_PAGE_TO_ROOT;
+	smc_input.a1 = virt_to_phys(data->pgd);
+	arm_smccc_1_2_smc(&smc_input,&smc_output);
+	if (smc_output.a0){
+		pr_trace("smmuv3: smc call to root failed");
+	}	
 	/* Ensure the empty pgd is visible before any actual TTBR write */
 	wmb();
 

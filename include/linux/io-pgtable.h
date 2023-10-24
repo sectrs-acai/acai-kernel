@@ -212,6 +212,15 @@ struct io_pgtable {
 	struct io_pgtable_ops	ops;
 };
 
+struct init_pte {
+	uint32_t bits_per_level;
+	uint64_t paddr;
+	uint64_t prot;
+	uint32_t lvl;
+	uint32_t num_entries;
+	uint64_t *ptep;
+};
+
 #define io_pgtable_ops_to_pgtable(x) container_of((x), struct io_pgtable, ops)
 
 static inline void io_pgtable_tlb_flush_all(struct io_pgtable *iop)

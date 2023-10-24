@@ -1122,7 +1122,8 @@ static int arm_smmu_attach_dev(struct iommu_domain *domain, struct device *dev)
 		dev_err(dev, "cannot attach to SMMU, is it on the same bus?\n");
 		return -ENXIO;
 	}
-
+	dev_err(dev, "wipwip\n");
+	pr_info("calling arm_smmu_attach_dev");
 	/*
 	 * FIXME: The arch/arm DMA API code tries to attach devices to its own
 	 * domains between of_xlate() and probe_device() - we have no way to cope

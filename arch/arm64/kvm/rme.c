@@ -13,7 +13,8 @@
 
 /************ FIXME: Copied from kvm/hyp/pgtable.c **********/
 #include <asm/kvm_pgtable.h>
-
+#define LIMBS(dst)	(dst >> (8*7)) & 0xFF, (dst >> (8*6)) & 0xFF, (dst >> (8*5)) & 0xFF, (dst >> (8*4)) & 0xFF, \
+					(dst >> (8*3)) & 0xFF, (dst >> (8*2)) & 0xFF, (dst >> (8*1)) & 0xFF, (dst >> (8*0)) & 0xFF
 struct kvm_pgtable_walk_data {
 	struct kvm_pgtable		*pgt;
 	struct kvm_pgtable_walker	*walker;
@@ -456,21 +457,25 @@ void kvm_realm_unmap_range(struct kvm *kvm, unsigned long ipa, u64 size)
 static int realm_create_protected_data_page(struct realm *realm,
 					    unsigned long ipa,
 					    struct page *dst_page,
-					    struct page *tmp_page)
+					    struct page *tmp_page, bool dev)
 {
 	phys_addr_t dst_phys, tmp_phys;
 	int ret;
-
+	unsigned long flags = RMI_MEASURE_CONTENT;
 	copy_page(page_address(tmp_page), page_address(dst_page));
 
-	dst_phys = page_to_phys(dst_page);
-	tmp_phys = page_to_phys(tmp_page);
+	dst_phys = page_to_phys(dst_page); // target
+	tmp_phys = page_to_phys(tmp_page); // source
 
 	if (rmi_granule_delegate(dst_phys))
 		return -ENXIO;
 
+	if(dev){
+		//TODO[Supraja] this should be different for RMI_NO_MEASURE_CONTENT
+		flags = 3UL;
+	}
 	ret = rmi_data_create(dst_phys, virt_to_phys(realm->rd), ipa, tmp_phys,
-			      RMI_MEASURE_CONTENT);
+			      flags);
 
 	if (RMI_RETURN_STATUS(ret) == RMI_ERROR_RTT) {
 		/* Create missing RTTs and retry */
@@ -482,7 +487,7 @@ static int realm_create_protected_data_page(struct realm *realm,
 			goto err;
 
 		ret = rmi_data_create(dst_phys, virt_to_phys(realm->rd), ipa,
-				      tmp_phys, RMI_MEASURE_CONTENT);
+				      tmp_phys, flags);
 	}
 
 	if (ret)
@@ -682,9 +687,55 @@ int realm_map_non_secure(struct realm *realm,
 	return 0;
 }
 
+//Pertie
+void make_dev_data(phys_addr_t dst_phy,unsigned long dst_virt,  unsigned long src_virt, phys_addr_t ipa[6], phys_addr_t pa[6]){
+	/*
+	device id : 8 bytes (0x00 0x00 device id (2 bytes) vendor id (2 bytes) bus number (2 bytes))
+	pci_config_addr : 8 bytes (this is the destination pa[dst] of the data create)
+	stream id : 4 bytes (TODO[Supraja]: check with SMMU impl to see what to set this to)
+	size1 - size 6 : 4 bytes each (sizes of bar regions)
+	reserved : 4 bytes 
+	ipa - pa pairs : regions in memory to map the bars to and set in pcie configuration ()
+	*/
+	// for(int i = 0; i < 6; i++){
+	// 	ERROR("bar %d ipa size %llx pa size %llx\n", i, ipa[i], pa[i]);
+	// }
+	printk("make dev data; ");
+	char src_data[]={0x00, 0x00, 0x02, 0x00, 
+					0x03, 0x00, 0x04, 0x00,
+					LIMBS(dst_phy),
+					// dst&0xFF, (dst >> 8) & 0xFF, (dst >> 16) & 0xFF, (dst >> 24) & 0xFF,  
+					// (dst >> 32) & 0xFF, (dst >> 40) & 0xFF, (dst >> 48) & 0xFF, (dst >> 56) & 0xFF,
+					0x00, 0x00, 0x00, 0x00, //Stream id 
+					0x00, 0x00, 0x10, 0x00,//size 1 4KB
+					0x00, 0x00, 0x10, 0x00,
+					0x00, 0x00, 0x10, 0x00,
+					0x00, 0x00, 0x10, 0x00,
+					0x00, 0x00, 0x10, 0x00,
+					0x00, 0x00, 0x10, 0x00, //size 6
+					0x00, 0x00, 0x00, 0x00, //reserved
+					LIMBS(ipa[0]), LIMBS(pa[0]),
+					LIMBS(ipa[1]), LIMBS(pa[1]),
+					LIMBS(ipa[2]), LIMBS(pa[2]),
+					LIMBS(ipa[3]), LIMBS(pa[3]),
+					LIMBS(ipa[4]), LIMBS(pa[4]),
+					LIMBS(ipa[5]), LIMBS(pa[5])
+					};
+	memcpy((char *)src_virt, src_data, 144);
+	memcpy((char *)dst_virt, src_data, 144);
+	// for(int i = 8; i <= 15; i++){
+	// 	ERROR("data %d %x %x \n", i, ((char *)src)[i], src_data[i]);
+	// }
+	// for(int i = 48; i <= 144; i++){
+	// 	ERROR("data %d %x %x \n", i, ((char *)src)[i], src_data[i]);
+	// }
+
+}
+
+
 static int populate_par_region(struct kvm *kvm,
 			       phys_addr_t ipa_base,
-			       phys_addr_t ipa_end)
+			       phys_addr_t ipa_end, bool dev)
 {
 	struct realm *realm = &kvm->arch.realm;
 	struct kvm_memory_slot *memslot;
@@ -694,7 +745,9 @@ static int populate_par_region(struct kvm *kvm,
 	int ret = 0;
 	struct page *tmp_page;
 	phys_addr_t rd = virt_to_phys(realm->rd);
-
+	int iter = 0;
+	phys_addr_t pa_dev[6], ipa_dev[6];
+	bool dev_page = false;
 	base_gfn = gpa_to_gfn(ipa_base);
 	end_gfn = gpa_to_gfn(ipa_end);
 
@@ -720,6 +773,7 @@ static int populate_par_region(struct kvm *kvm,
 	mmap_read_lock(current->mm);
 
 	ipa = ipa_base;
+
 
 	while (ipa < ipa_end) {
 		struct vm_area_struct *vma;
@@ -799,13 +853,44 @@ static int populate_par_region(struct kvm *kvm,
 		}
 
 		page = pfn_to_page(pfn);
-
+		
 		for (offset = 0; offset < map_size && !ret;
 		     offset += PAGE_SIZE, page++) {
 			phys_addr_t page_ipa = ipa + offset;
+			if(dev){
+				if(iter < 6){
+					ipa_dev[iter] = ipa;
+					pa_dev[iter] = page_to_phys(page);
+					printk("i %d ipa[i] %llx pa[i] %llx pfn %llx;  ", iter, ipa_dev[iter], pa_dev[iter], pfn);
+					iter ++;
+				}else{
+					dev_page = true;
+					phys_addr_t tmp_phys = page_to_phys(tmp_page);
+					phys_addr_t page_phys = page_to_phys(page);
+					unsigned long tmp_virt = (unsigned long)phys_to_virt(tmp_phys);
+					unsigned long page_virt = (unsigned long) phys_to_virt(page_phys);
+					printk("i %d tmp_phys %llx tmp_virt %llx page_phys %llx page_virt %llx pfn %llx;  ", iter, tmp_phys, tmp_virt, page_phys, page_virt, pfn);
+					make_dev_data(page_phys, page_virt, tmp_virt, ipa_dev, pa_dev); //this should populate the pages with dev_data 
+					iter++;
+				}
+			//Pertie: this is the last granule. Make it a data granule. 
+			//src page is "tmp_page"
+			//target page is "page" : write data to this. 
+			 
+				// u_register_t dev_granule_addr = src_pa + i * PAGE_SIZE;
+				// make_dev_data(realm->par_base + i * PAGE_SIZE,dev_granule_addr,ipa,pa);
+				
+				// printk("tmp_phys %llx ;", tmp_phys);
+				// dump_stack();
+				// ipa += map_size;
+			//FIXME: the bar address region is not addressable as granules in the RMM implementation. The checks cannot be performed. For now just use this. 
+			
+ 			}
 
-			ret = realm_create_protected_data_page(realm, page_ipa,
-							       page, tmp_page);
+				ret = realm_create_protected_data_page(realm, page_ipa,
+							       page, tmp_page, dev_page);
+			
+			
 		}
 		if (ret)
 			goto err_release_pfn;
@@ -847,13 +932,14 @@ static int kvm_populate_realm(struct kvm *kvm,
 	    !IS_ALIGNED(args->populate_ipa_size, PAGE_SIZE))
 		return -EINVAL;
 
+	printk(" size in kernel %llu ;", args->populate_ipa_size);
 	ipa_base = args->populate_ipa_base;
 	ipa_end = ipa_base + args->populate_ipa_size;
 
 	if (ipa_end < ipa_base)
 		return -EINVAL;
 
-	return populate_par_region(kvm, ipa_base, ipa_end);
+	return populate_par_region(kvm, ipa_base, ipa_end, args->dev_attach);
 }
 
 static int set_ipa_state(struct kvm_vcpu *vcpu,

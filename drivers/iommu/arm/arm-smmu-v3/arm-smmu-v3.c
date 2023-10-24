@@ -26,10 +26,14 @@
 #include <linux/pci.h>
 #include <linux/pci-ats.h>
 #include <linux/platform_device.h>
+#include <linux/arm-smccc.h>
 
 #include "arm-smmu-v3.h"
 #include "../../dma-iommu.h"
 #include "../../iommu-sva.h"
+#include <linux/dma-mapping.h> 
+
+#define DEVICE_STREAM_ID 31
 
 static bool disable_bypass = true;
 module_param(disable_bypass, bool, 0444);
@@ -40,6 +44,19 @@ static bool disable_msipolling;
 module_param(disable_msipolling, bool, 0444);
 MODULE_PARM_DESC(disable_msipolling,
 	"Disable MSI-based polling for CMD_SYNC completion.");
+
+#define pr_trace(...);
+
+/*Linked List Node*/
+struct smmu_master_list{
+     struct list_head list;     //linux kernel list implementation
+     struct arm_smmu_master *master;
+};
+
+LIST_HEAD(smmu_master_list_head);
+
+struct arm_smmu_master *getMasterFromStream_ID(unsigned int sid);
+struct arm_smmu_master *getMasterFromDomain(struct arm_smmu_domain *domain);
 
 enum arm_smmu_msi_index {
 	EVTQ_MSI_INDEX,
@@ -136,6 +153,7 @@ static bool queue_consumed(struct arm_smmu_ll_queue *q, u32 prod)
 		(Q_IDX(q, q->cons) <= Q_IDX(q, prod)));
 }
 
+// move llq.cons to cons_reg (points to the smmu struct.)
 static void queue_sync_cons_out(struct arm_smmu_queue *q)
 {
 	/*
@@ -204,18 +222,60 @@ static int queue_poll(struct arm_smmu_queue_poll *qp)
 	return 0;
 }
 
+#define SMC_WRITE_TO_CMD_QUEUE	0xc40001c1
+
+static unsigned long smc_write_to_cmd_queue(uint64_t first_val,uint64_t sec_val){
+	struct arm_smccc_1_2_regs smc_input = {
+		.a0 = SMC_WRITE_TO_CMD_QUEUE,
+		.a1 = first_val,
+		.a2 = sec_val,
+	};
+	struct arm_smccc_1_2_regs smc_output;
+	arm_smccc_1_2_smc(&smc_input,&smc_output);
+	if (smc_output.a0){
+		pr_trace("smmuv3: smc call to root failed (smc_write_to_cmd_queue)");
+	}else{
+		pr_trace("smmuv3: smc call to root success (smc_write_to_cmd_queue)");
+	}
+	return smc_output.a0;
+}
+
+/* static unsigned long smc_read_from_cmd_queue(uint64_t *first_val,uint64_t *sec_val){
+	struct arm_smccc_1_2_regs smc_input = {
+		.a0 = SMC_WRITE_TO_CMD_QUEUE,
+	};
+	struct arm_smccc_1_2_regs smc_output;
+	arm_smccc_1_2_smc(&smc_input,&smc_output);
+	if (smc_output.a0){
+		pr_trace("smmuv3: smc call to root failed (smc_write_to_cmd_queue)");
+	}else{
+		pr_trace("smmuv3: smc call to root success (smc_write_to_cmd_queue)");
+	}
+	return smc_output.a0;
+} */
+
 static void queue_write(__le64 *dst, u64 *src, size_t n_dwords)
 {
 	int i;
-
+	uint64_t first,sec;
+	pr_trace("smmuv3: write to queue at 0x%llx | dwords %lx",virt_to_phys(dst), n_dwords);
+	if (n_dwords == 2){
+		first = cpu_to_le64(*src++);
+		sec = cpu_to_le64(*src++);
+		smc_write_to_cmd_queue(first,sec);
+		return;
+	}
+	pr_err("smmuv3: COULD NOT WRITE to queue at 0x%llx | dwords %lx",virt_to_phys(dst), n_dwords);
+	return;
 	for (i = 0; i < n_dwords; ++i)
 		*dst++ = cpu_to_le64(*src++);
+	return;
 }
 
 static void queue_read(u64 *dst, __le64 *src, size_t n_dwords)
 {
 	int i;
-
+	return;
 	for (i = 0; i < n_dwords; ++i)
 		*dst++ = le64_to_cpu(*src++);
 }
@@ -224,7 +284,8 @@ static int queue_remove_raw(struct arm_smmu_queue *q, u64 *ent)
 {
 	if (queue_empty(&q->llq))
 		return -EAGAIN;
-
+	pr_trace("----------------------------------------\n");
+	pr_trace("queue remove raw called\n");
 	queue_read(ent, Q_ENT(q, q->llq.cons), q->ent_dwords);
 	queue_inc_cons(&q->llq);
 	queue_sync_cons_out(q);
@@ -707,7 +768,8 @@ static void arm_smmu_cmdq_write_entries(struct arm_smmu_cmdq *cmdq, u64 *cmds,
 
 	for (i = 0; i < n; ++i) {
 		u64 *cmd = &cmds[i * CMDQ_ENT_DWORDS];
-
+		pr_trace("smmuv3: write to cmd queue, cmd[0]: %llx | cmd[1]: %llx",cmd[0],cmd[1]);
+		pr_trace("smmuv3: consumer: 0x%x | producer: 0x%x",*cmdq->q.cons_reg,*cmdq->q.prod_reg);
 		prod = queue_inc_prod_n(&llq, i);
 		queue_write(Q_ENT(&cmdq->q, prod), cmd, CMDQ_ENT_DWORDS);
 	}
@@ -740,7 +802,12 @@ static int arm_smmu_cmdq_issue_cmdlist(struct arm_smmu_device *smmu,
 	struct arm_smmu_ll_queue llq, head;
 	int ret = 0;
 
+	pr_trace("smmuv3: calling arm_smmu_cmdq_issue_cmdlist");
 	llq.max_n_shift = cmdq->q.llq.max_n_shift;
+
+	// Marker
+	arm_smmu_cmdq_write_entries(cmdq, cmds, llq.prod, n);
+	return 0;
 
 	/* 1. Allocate some space in the queue */
 	local_irq_save(flags);
@@ -1272,7 +1339,7 @@ static void arm_smmu_write_strtab_ent(struct arm_smmu_master *master, u32 sid,
 		smmu_domain = master->domain;
 		smmu = master->smmu;
 	}
-
+	// dev_info(smmu->dev,"writing STE entry and syncing with smmu, stage: %d",smmu_domain->stage);
 	if (smmu_domain) {
 		switch (smmu_domain->stage) {
 		case ARM_SMMU_DOMAIN_S1:
@@ -1286,6 +1353,10 @@ static void arm_smmu_write_strtab_ent(struct arm_smmu_master *master, u32 sid,
 			break;
 		}
 	}
+	if (s2_cfg)
+		dev_info(smmu->dev,"writing STE entry with vttbr: %llx",s2_cfg->vttbr);
+	else
+		dev_err(smmu->dev,"s2 config is not present ERROR");
 
 	if (val & STRTAB_STE_0_V) {
 		switch (FIELD_GET(STRTAB_STE_0_CFG, val)) {
@@ -1371,6 +1442,8 @@ static void arm_smmu_write_strtab_ent(struct arm_smmu_master *master, u32 sid,
 	arm_smmu_sync_ste_for_sid(smmu, sid);
 	/* See comment in arm_smmu_write_ctx_desc() */
 	WRITE_ONCE(dst[0], cpu_to_le64(val));
+	// is this synchronous or asynchronous ???
+	// TOCTOU vulnerable???
 	arm_smmu_sync_ste_for_sid(smmu, sid);
 
 	/* It's likely that we'll want to use the new STE soon */
@@ -1459,20 +1532,28 @@ static int arm_smmu_handle_evt(struct arm_smmu_device *smmu, u64 *evt)
 	struct iommu_fault_event fault_evt = { };
 	struct iommu_fault *flt = &fault_evt.fault;
 
+	dev_info(smmu->dev, "SSID valid %d | StreamID value %d",ssid_valid, sid);
+	//dev_info(smmu->dev, "%d", smmu->strtab_cfg.);
+
 	switch (FIELD_GET(EVTQ_0_ID, evt[0])) {
 	case EVT_ID_TRANSLATION_FAULT:
+		dev_info(smmu->dev, "EVT_ID_TRANSLATION_FAULT");
 		reason = IOMMU_FAULT_REASON_PTE_FETCH;
 		break;
 	case EVT_ID_ADDR_SIZE_FAULT:
+		dev_info(smmu->dev, "EVT_ID_ADDR_SIZE_FAULT");
 		reason = IOMMU_FAULT_REASON_OOR_ADDRESS;
 		break;
 	case EVT_ID_ACCESS_FAULT:
+		dev_info(smmu->dev, "EVT_ID_ACCESS_FAULT");
 		reason = IOMMU_FAULT_REASON_ACCESS;
 		break;
 	case EVT_ID_PERMISSION_FAULT:
+		dev_info(smmu->dev, "EVT_ID_PERMISSION_FAULT");
 		reason = IOMMU_FAULT_REASON_PERMISSION;
 		break;
 	default:
+		dev_info(smmu->dev, "EVT_ID Unknown");
 		return -EOPNOTSUPP;
 	}
 
@@ -1526,6 +1607,9 @@ static int arm_smmu_handle_evt(struct arm_smmu_device *smmu, u64 *evt)
 		goto out_unlock;
 	}
 
+	if (!master->dev){
+		goto out_unlock;
+	}
 	ret = iommu_report_device_fault(master->dev, &fault_evt);
 	if (ret && flt->type == IOMMU_FAULT_PAGE_REQ) {
 		/* Nobody cared, abort the access */
@@ -1542,6 +1626,7 @@ out_unlock:
 	return ret;
 }
 
+// on evtq interrupt this function will be triggered.
 static irqreturn_t arm_smmu_evtq_thread(int irq, void *dev)
 {
 	int i, ret;
@@ -1555,6 +1640,8 @@ static irqreturn_t arm_smmu_evtq_thread(int irq, void *dev)
 	do {
 		while (!queue_remove_raw(q, evt)) {
 			u8 id = FIELD_GET(EVTQ_0_ID, evt[0]);
+
+			dev_info(smmu->dev, "handle events arm_smmu_evtq_thread");
 
 			ret = arm_smmu_handle_evt(smmu, evt);
 			if (!ret || !__ratelimit(&rs))
@@ -2122,6 +2209,7 @@ static int arm_smmu_domain_finalise_s1(struct arm_smmu_domain *smmu_domain,
 	 * the master has been added to the devices list for this domain.
 	 * This isn't an issue because the STE hasn't been installed yet.
 	 */
+	// Initialize CD for ssid 0 (no substreams)
 	ret = arm_smmu_write_ctx_desc(smmu_domain, 0, &cfg->cd);
 	if (ret)
 		goto out_free_cd_tables;
@@ -2146,6 +2234,8 @@ static int arm_smmu_domain_finalise_s2(struct arm_smmu_domain *smmu_domain,
 	struct arm_smmu_device *smmu = smmu_domain->smmu;
 	struct arm_smmu_s2_cfg *cfg = &smmu_domain->s2_cfg;
 	typeof(&pgtbl_cfg->arm_lpae_s2_cfg.vtcr) vtcr;
+
+	dev_info(smmu->dev, "finalising s2 table");
 
 	vmid = arm_smmu_bitmap_alloc(smmu->vmid_map, smmu->vmid_bits);
 	if (vmid < 0)
@@ -2183,11 +2273,18 @@ static int arm_smmu_domain_finalise(struct iommu_domain *domain,
 		return 0;
 	}
 
+	dev_info(smmu->dev,"ARM_SMMU setting stage");
+	smmu_domain->stage = ARM_SMMU_DOMAIN_S2;
+
 	/* Restrict the stage to what we can actually support */
-	if (!(smmu->features & ARM_SMMU_FEAT_TRANS_S1))
+	if (!(smmu->features & ARM_SMMU_FEAT_TRANS_S1)){
 		smmu_domain->stage = ARM_SMMU_DOMAIN_S2;
-	if (!(smmu->features & ARM_SMMU_FEAT_TRANS_S2))
+		dev_info(smmu->dev,"ARM_SMMU domain s2");
+	}
+	if (!(smmu->features & ARM_SMMU_FEAT_TRANS_S2)){
+		dev_info(smmu->dev,"ARM_SMMU domain s1");
 		smmu_domain->stage = ARM_SMMU_DOMAIN_S1;
+	}
 
 	switch (smmu_domain->stage) {
 	case ARM_SMMU_DOMAIN_S1:
@@ -2217,6 +2314,8 @@ static int arm_smmu_domain_finalise(struct iommu_domain *domain,
 		.iommu_dev	= smmu->dev,
 	};
 
+	// marker change it and pass the device as well.
+	dev_info(smmu->dev, "before alloc_io_pgtable_ops, domain-stage type: %x",smmu_domain->stage);
 	pgtbl_ops = alloc_io_pgtable_ops(fmt, &pgtbl_cfg, smmu_domain);
 	if (!pgtbl_ops)
 		return -ENOMEM;
@@ -2225,6 +2324,9 @@ static int arm_smmu_domain_finalise(struct iommu_domain *domain,
 	domain->geometry.aperture_end = (1UL << pgtbl_cfg.ias) - 1;
 	domain->geometry.force_aperture = true;
 
+	// pgtbl_cfg holds the pgd pointer.
+	// This call initializes the CD descriptor. So the SMMU could read them,
+	// once the STE entry is inserted
 	ret = finalise_stage_fn(smmu_domain, master, &pgtbl_cfg);
 	if (ret < 0) {
 		free_io_pgtable_ops(pgtbl_ops);
@@ -2240,6 +2342,7 @@ static __le64 *arm_smmu_get_step_for_sid(struct arm_smmu_device *smmu, u32 sid)
 	__le64 *step;
 	struct arm_smmu_strtab_cfg *cfg = &smmu->strtab_cfg;
 
+	dev_info(smmu->dev,"get STE pointer for sid %d",sid);
 	if (smmu->features & ARM_SMMU_FEAT_2_LVL_STRTAB) {
 		struct arm_smmu_strtab_l1_desc *l1_desc;
 		int idx;
@@ -2396,6 +2499,9 @@ static void arm_smmu_detach_dev(struct arm_smmu_master *master)
 	arm_smmu_install_ste_for_dev(master);
 }
 
+static unsigned long transition_ste_to_root(struct arm_smmu_device *smmu);
+static unsigned long transition_control_page_to_root(struct arm_smmu_device *smmu);
+
 static int arm_smmu_attach_dev(struct iommu_domain *domain, struct device *dev)
 {
 	int ret = 0;
@@ -2408,8 +2514,25 @@ static int arm_smmu_attach_dev(struct iommu_domain *domain, struct device *dev)
 	if (!fwspec)
 		return -ENOENT;
 
+	// attach dev is called, after probe device
+	// probe device allocates a 'master' struct
+	// which contains the necessary configuration data
+
+	master = getMasterFromStream_ID(31);
+	if (master){
+		pr_trace("smmuv3: found sid in master %p",master);
+	}else{
+		pr_trace("smmuv3: sid not found");
+	}
+
+	// master
+	// -> arm_smmu_domain
+	// ->-> arm_smmu_s1_cfg
+	// ->->-> ttbr
+	// Use sid to get bus/device/function -> use this to get pci device -> use it to get
 	master = dev_iommu_priv_get(dev);
 	smmu = master->smmu;
+	dev_info(smmu->dev, "attaching device %llx", (__u64)dev);
 
 	/*
 	 * Checking that SVA is disabled ensures that this device isn't bound to
@@ -2425,6 +2548,9 @@ static int arm_smmu_attach_dev(struct iommu_domain *domain, struct device *dev)
 
 	mutex_lock(&smmu_domain->init_mutex);
 
+	// finalising the domain allocates the pgd directory and the
+	// 'map_pages' code
+	// Furthermore it also writes the CD descritior of ssid 0
 	if (!smmu_domain->smmu) {
 		smmu_domain->smmu = smmu;
 		ret = arm_smmu_domain_finalise(domain, master);
@@ -2450,8 +2576,25 @@ static int arm_smmu_attach_dev(struct iommu_domain *domain, struct device *dev)
 	if (smmu_domain->stage != ARM_SMMU_DOMAIN_BYPASS)
 		master->ats_enabled = arm_smmu_ats_supported(master);
 
+	// Once the CD and all config structures are configured we
+	// can finally insert the STE to enable translation.
 	arm_smmu_install_ste_for_dev(master);
 
+	// racy, but afaik the kernel code initalizes the pci devs synchronous
+	dev_info(smmu->dev,"registered dev: %x",++smmu->num_registered_devs);
+	// contidion to pass the smmu stream tables to root
+	if (smmu->num_registered_devs == 4){
+		dev_info(smmu->dev,"calling transition_ste_to_root");
+		if (transition_ste_to_root(smmu)){
+			dev_err(smmu->dev,"failed to transition stream table");
+		}
+		dev_info(smmu->dev,"calling transition_control_page_to_root");
+		if (transition_control_page_to_root(smmu)){
+			dev_err(smmu->dev,"failed to transition control page");
+		}
+	}
+
+	// we add the master to the device list of the smmu
 	spin_lock_irqsave(&smmu_domain->devices_lock, flags);
 	list_add(&master->domain_head, &smmu_domain->devices);
 	spin_unlock_irqrestore(&smmu_domain->devices_lock, flags);
@@ -2559,6 +2702,7 @@ static int arm_smmu_insert_master(struct arm_smmu_device *smmu,
 {
 	int i;
 	int ret = 0;
+	struct smmu_master_list *temp_node = NULL;
 	struct arm_smmu_stream *new_stream, *cur_stream;
 	struct rb_node **new_node, *parent_node = NULL;
 	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(master->dev);
@@ -2571,6 +2715,8 @@ static int arm_smmu_insert_master(struct arm_smmu_device *smmu,
 
 	mutex_lock(&smmu->streams_mutex);
 	for (i = 0; i < fwspec->num_ids; i++) {
+		// security relevant, reads the fwsepc from
+		// the id field (bus,dev,func)
 		u32 sid = fwspec->ids[i];
 
 		new_stream = &master->streams[i];
@@ -2613,6 +2759,22 @@ static int arm_smmu_insert_master(struct arm_smmu_device *smmu,
 	}
 	mutex_unlock(&smmu->streams_mutex);
 
+	if(!ret){
+        temp_node = kmalloc(sizeof(struct smmu_master_list), GFP_KERNEL);
+
+        /*Assgin the data that is received*/
+        temp_node->master = master;
+
+		if (master->streams != NULL){
+			pr_trace("smmuv3: master sid: %d",master->streams[0].id);
+		}
+        /*Init the list within the struct*/
+        INIT_LIST_HEAD(&temp_node->list);
+
+		list_add_tail(&temp_node->list, &smmu_master_list_head);
+	}
+
+
 	return ret;
 }
 
@@ -2633,8 +2795,204 @@ static void arm_smmu_remove_master(struct arm_smmu_master *master)
 	kfree(master->streams);
 }
 
+int arm_smmu_attach_testengine(struct iommu_domain *domain,struct arm_smmu_device *smmu, u32 sid)
+{
+	int ret = 0;
+	unsigned long flags;
+	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
+	struct arm_smmu_master *master;
+
+	master = arm_smmu_find_master(smmu, sid);
+	if (!master) {
+		return -EINVAL;
+	}
+	/* dev_info(smmu->dev, "before domain finalise");
+	ret = arm_smmu_domain_finalise(domain,master);
+	if (ret){
+		return ret;
+	} */
+	dev_info(smmu->dev, "attaching master %llx", (__u64)master);
+
+	arm_smmu_detach_dev(master);
+
+	mutex_lock(&smmu_domain->init_mutex);
+
+	if (!smmu_domain->smmu) {
+		smmu_domain->smmu = smmu;
+		ret = arm_smmu_domain_finalise(domain, master);
+		if (ret) {
+			smmu_domain->smmu = NULL;
+			goto out_unlock;
+		}
+	} else if (smmu_domain->smmu != smmu) {
+		ret = -EINVAL;
+		goto out_unlock;
+	} else if (smmu_domain->stage == ARM_SMMU_DOMAIN_S1 &&
+		   master->ssid_bits != smmu_domain->s1_cfg.s1cdmax) {
+		ret = -EINVAL;
+		goto out_unlock;
+	} else if (smmu_domain->stage == ARM_SMMU_DOMAIN_S1 &&
+		   smmu_domain->stall_enabled != master->stall_enabled) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	master->domain = smmu_domain;
+	// no ats supported
+	master->ats_enabled = false;
+
+	arm_smmu_install_ste_for_dev(master);
+
+		// racy, but afaik the kernel code initalizes the pci devs synchronous
+	dev_info(smmu->dev,"registered dev: %x",++smmu->num_registered_devs);
+	// contidion to pass the smmu stream tables to root
+	if (smmu->num_registered_devs == 4){
+		dev_info(smmu->dev,"calling transition_ste_to_root");
+		if (transition_ste_to_root(smmu)){
+			dev_err(smmu->dev,"failed to transition stream table");
+		}
+		dev_info(smmu->dev,"calling transition_control_page_to_root");
+		if (transition_control_page_to_root(smmu)){
+			dev_err(smmu->dev,"failed to transition control page");
+		}
+	}
+
+	spin_lock_irqsave(&smmu_domain->devices_lock, flags);
+	list_add(&master->domain_head, &smmu_domain->devices);
+	spin_unlock_irqrestore(&smmu_domain->devices_lock, flags);
+
+	// should directly return before we access master->dev
+	arm_smmu_enable_ats(master);
+out_unlock:
+	pr_trace("smmuv3: attached testengine, pgtabl_ops: %llx | ret: %x", (u64)smmu_domain->pgtbl_ops,ret);
+	mutex_unlock(&smmu_domain->init_mutex);
+	return ret;
+}
+
+static int insert_testengine_master(struct arm_smmu_device *smmu,
+				  struct arm_smmu_master *master,u32 sid)
+{
+	int i;
+	int ret = 0;
+	struct smmu_master_list *temp_node = NULL;
+	struct arm_smmu_stream *new_stream, *cur_stream;
+	struct rb_node **new_node, *parent_node = NULL;
+
+	master->streams = kcalloc(1, sizeof(*master->streams),
+				  GFP_KERNEL);
+	if (!master->streams)
+		return -ENOMEM;
+	master->num_streams = 1;
+
+	mutex_lock(&smmu->streams_mutex);
+	for (i = 0; i < 1; i++) {
+		/*
+			-------------------------------------------
+				SID IS SET IN THE DRIVER CODE
+		   	-------------------------------------------
+		*/
+
+		new_stream = &master->streams[i];
+		new_stream->id = sid;
+		new_stream->master = master;
+
+		ret = arm_smmu_init_sid_strtab(smmu, sid);
+		if (ret)
+			break;
+
+		/* Insert into SID tree */
+		new_node = &(smmu->streams.rb_node);
+		while (*new_node) {
+			cur_stream = rb_entry(*new_node, struct arm_smmu_stream,
+					      node);
+			parent_node = *new_node;
+			if (cur_stream->id > new_stream->id) {
+				new_node = &((*new_node)->rb_left);
+			} else if (cur_stream->id < new_stream->id) {
+				new_node = &((*new_node)->rb_right);
+			} else {
+				dev_warn(master->dev,
+					 "stream %u already in tree\n",
+					 cur_stream->id);
+				ret = -EINVAL;
+				break;
+			}
+		}
+		if (ret)
+			break;
+
+		rb_link_node(&new_stream->node, parent_node, new_node);
+		rb_insert_color(&new_stream->node, &smmu->streams);
+	}
+
+	if (ret) {
+		for (i--; i >= 0; i--)
+			rb_erase(&master->streams[i].node, &smmu->streams);
+		kfree(master->streams);
+	}
+
+	if(!ret){
+        temp_node = kmalloc(sizeof(struct smmu_master_list), GFP_KERNEL);
+
+        /*Assgin the data that is received*/
+        temp_node->master = master;
+
+		if (master->streams != NULL){
+			pr_trace("smmuv3: master sid: %d",master->streams[0].id);
+		}
+        /*Init the list within the struct*/
+        INIT_LIST_HEAD(&temp_node->list);
+
+		list_add_tail(&temp_node->list, &smmu_master_list_head);
+	}
+
+	mutex_unlock(&smmu->streams_mutex);
+
+	return ret;
+}
+
+struct iommu_device *createTestengineEntry(struct arm_smmu_device *smmu, u32 sid)
+{
+	int ret;
+	struct arm_smmu_master *master;
+
+	if(smmu == NULL){
+		pr_trace("smmuv3 createTestengineEntry call without smmu");
+		return NULL;
+	}
+	dev_info(smmu->dev, "starting createTestengineEntry");
+	master = kzalloc(sizeof(*master), GFP_KERNEL);
+	if (!master)
+		return ERR_PTR(-ENOMEM);
+
+	master->dev = NULL;
+	master->smmu = smmu;
+	INIT_LIST_HEAD(&master->bonds);
+
+	ret = insert_testengine_master(smmu, master, sid);
+	if (ret)
+		goto err_free_master;
+
+	master->ssid_bits = 10;
+	master->ssid_bits = min(smmu->ssid_bits, master->ssid_bits);
+	master->num_streams = 1;
+	master->streams = kzalloc(sizeof(struct arm_smmu_stream), GFP_KERNEL);
+	// CAREFULL MUST MATCH WITH STREAMID
+	master->streams[0].id = DEVICE_STREAM_ID;
+
+
+	dev_info(smmu->dev, "success createTestengineEntry");
+	return &smmu->iommu;
+
+err_free_master:
+	kfree(master);
+	return ERR_PTR(ret);
+}
+
+
 static struct iommu_ops arm_smmu_ops;
 
+// Code to register a new PCIe device ??????
 static struct iommu_device *arm_smmu_probe_device(struct device *dev)
 {
 	int ret;
@@ -2648,6 +3006,7 @@ static struct iommu_device *arm_smmu_probe_device(struct device *dev)
 	if (WARN_ON_ONCE(dev_iommu_priv_get(dev)))
 		return ERR_PTR(-EBUSY);
 
+	dev_info(dev, "smmu_probe_device");
 	smmu = arm_smmu_get_by_fwnode(fwspec->iommu_fwnode);
 	if (!smmu)
 		return ERR_PTR(-ENODEV);
@@ -2661,6 +3020,8 @@ static struct iommu_device *arm_smmu_probe_device(struct device *dev)
 	INIT_LIST_HEAD(&master->bonds);
 	dev_iommu_priv_set(dev, master);
 
+	// This registers the smmu management struct for this device
+	// furthermode it sets the STREAM ID values
 	ret = arm_smmu_insert_master(smmu, master);
 	if (ret)
 		goto err_free_master;
@@ -2843,6 +3204,193 @@ static void arm_smmu_remove_dev_pasid(struct device *dev, ioasid_t pasid)
 	arm_smmu_sva_remove_dev_pasid(domain, dev, pasid);
 }
 
+
+struct arm_smmu_master *getMasterFromDoamin(unsigned int sid){
+	int i;
+	struct smmu_master_list *elem;
+
+	list_for_each_entry(elem,&smmu_master_list_head,list){
+		for (i = 0; i < elem->master->num_streams; i++){
+			if (!elem->master->streams){
+				pr_err("streams is NULL \n");
+				continue;
+			}
+			if (elem->master->streams[i].id == sid){
+				return elem->master;
+			}
+		}
+	}
+	return NULL;
+}
+struct arm_smmu_master *getMasterFromStream_ID(unsigned int sid){
+	int i;
+	struct smmu_master_list *elem;
+
+	list_for_each_entry(elem,&smmu_master_list_head,list){
+		for (i = 0; i < elem->master->num_streams; i++){
+			if (!elem->master->streams){
+				pr_err("streams is NULL \n");
+				continue;
+			}
+			if (elem->master->streams[i].id == sid){
+				return elem->master;
+			}
+		}
+	}
+	return NULL;
+}
+
+unsigned long get_sid_from_vttbr(unsigned long vttbr){
+	struct smmu_master_list *elem;
+
+	list_for_each_entry(elem,&smmu_master_list_head,list){
+		if (elem->master->domain->s2_cfg.vttbr == vttbr){
+			if (elem->master->streams){
+				return elem->master->streams[0].id;
+			}
+			pr_err("smmuv3: no stream associated with vttbr %lx", vttbr);
+			return -1;
+		}
+	}
+	return -1;
+}
+
+
+void hexdump_memory(char *data, unsigned long byte_count) {
+  for (unsigned long dumped = 0; dumped < byte_count;dumped += 16) {
+    unsigned long byte_offset = dumped;
+    int bytes[16];
+    char line[1000];
+    char *linep = line;
+    for (int i=0; i<16; i++) {
+      bytes[i] = data[dumped + i];
+    }
+    linep += sprintf(linep, "%016lx  ", byte_offset);
+    for (int i=0; i<16; i++) {
+      if (bytes[i] == -1) {
+        linep += sprintf(linep, "?? ");
+      } else {
+        linep += sprintf(linep, "%02hhx ", (unsigned char)bytes[i]);
+      }
+    }
+    linep += sprintf(linep, " |");
+    for (int i=0; i<16; i++) {
+      if (bytes[i] == -1) {
+        *(linep++) = '?';
+      } else {
+        *(linep++) = bytes[i];
+      }
+    }
+    linep += sprintf(linep, "|");
+    printk("%s\n",line);
+  }
+}
+
+extern int testengine_copy_and_check_status(uintptr_t target_phys_addr,uintptr_t source_phys_addr, uint64_t size, bool check);
+extern bool run_tests(struct io_pgtable_ops *ops);
+
+int map_pages_from_sid(unsigned int sid, unsigned long pa, unsigned long va, unsigned long num_pages){
+	struct arm_smmu_master *master;
+	struct iommu_domain *dom;
+	size_t mapped = 0;
+	int pg_size = 4096;
+	int ret;
+
+	pr_trace("getting masters from Stream ID: %x",sid);
+	master = getMasterFromStream_ID(sid);
+	if(!master){
+		pr_err("smmuv3: MASTER NOT FOUND, sid %d",sid);
+		return -EINVAL;
+	}
+	pr_trace("received master from Stream ID: %x, master %p",sid, master);
+	/* (struct iommu_domain *domain, unsigned long iova,
+			      phys_addr_t paddr, size_t pgsize, size_t pgcount,
+			      int prot, gfp_t gfp, size_t *mapped) */
+	dom = &master->domain->domain;
+
+	pr_trace("smmu domain: %p, iommu domain %p",master->domain,&master->domain->domain);
+	pr_trace("domain ops: %p, smmu domain pgtable ops %p",dom->ops,master->domain->pgtbl_ops);
+
+	pr_trace("mapping va: %lx | pa: %lx", va, pa);
+	//ret = dom->ops->map_pages(dom,va,pa,pg_size,pg_num, (IOMMU_WRITE | IOMMU_READ),GFP_DMA | __GFP_ZERO, &mapped);
+	do{
+		ret = master->domain->pgtbl_ops->map_pages(master->domain->pgtbl_ops,va,pa,pg_size,num_pages, (IOMMU_WRITE | IOMMU_READ),GFP_DMA | __GFP_ZERO, &mapped);
+		if (ret){
+			pr_trace("smmuv3: error mapping pages with custom sid from root");
+			return ret;
+		}
+	}while(mapped != (pg_size*num_pages));
+	return 0;
+}
+EXPORT_SYMBOL(map_pages_from_sid);
+
+int execute_testengine_dma(unsigned int sid, unsigned long iova_src, unsigned long iova_dst){
+	return testengine_copy_and_check_status(iova_dst,iova_src,4096,false);
+}
+
+#define SMC_TRANSITION_STREAM_TABLE	0xc40001bc
+
+#define SMC_DELEGATE_S2_TABLE_MEM	0xc40001be
+
+#define SMC_RMM_MEMSET	0xc40001c0
+
+#define SMC_TRANSITION_CONTROl_PAGE	0xc40001c2
+
+static unsigned long transition_control_page_to_root(struct arm_smmu_device *smmu){
+	struct arm_smccc_1_2_regs smc_input = {
+		.a0 = SMC_TRANSITION_CONTROl_PAGE,
+		.a1 = smmu->ioaddr,
+	};
+	struct arm_smccc_1_2_regs smc_output;
+	arm_smccc_1_2_smc(&smc_input,&smc_output);
+	if (smc_output.a0){
+		pr_trace("smmuv3: smc call to root failed (transition_control_page_to_root)");
+	}
+	return smc_output.a0;
+}
+
+static unsigned long transition_ste_to_root(struct arm_smmu_device *smmu){
+	struct arm_smccc_1_2_regs smc_input = {
+		.a0 = SMC_TRANSITION_STREAM_TABLE,
+		.a1 = smmu->strtab_cfg.strtab_dma,
+		.a2 = smmu->strtab_cfg.num_l1_ents * STRTAB_STE_DWORDS,
+	};
+	struct arm_smccc_1_2_regs smc_output;
+	arm_smccc_1_2_smc(&smc_input,&smc_output);
+	if (smc_output.a0){
+		pr_trace("smmuv3: smc call to root failed (transition_ste_to_root)");
+	}
+	return smc_output.a0;
+}
+
+static unsigned long transition_s2_table_memory_to_root(unsigned long base_addr, unsigned long size){
+		struct arm_smccc_1_2_regs smc_input = {
+		.a0 = SMC_DELEGATE_S2_TABLE_MEM,
+		.a1 = base_addr,
+		.a2 = size,
+	};
+	struct arm_smccc_1_2_regs smc_output;
+	arm_smccc_1_2_smc(&smc_input,&smc_output);
+	if (smc_output.a0){
+		pr_trace("smmuv3: smc call to root failed (transition_s2_table_memory_to_root)");
+	}
+	return smc_output.a0;
+}
+
+static unsigned long rmm_memset(u64 addr, u64 value){
+	struct arm_smccc_1_2_regs smc_input = {
+		.a0 = SMC_RMM_MEMSET,
+		.a1 = addr,
+		.a2 = value,
+	};
+	struct arm_smccc_1_2_regs smc_output;
+	arm_smccc_1_2_smc(&smc_input,&smc_output);
+	if (smc_output.a0){
+		pr_trace("smmuv3: smc call to root failed (rmm_memset)");
+	}
+	return smc_output.a0;
+}
+
 static struct iommu_ops arm_smmu_ops = {
 	.capable		= arm_smmu_capable,
 	.domain_alloc		= arm_smmu_domain_alloc,
@@ -2870,6 +3418,27 @@ static struct iommu_ops arm_smmu_ops = {
 	}
 };
 
+#define SMC_TRANSITION_RING_BUFFER	0xc40001bf
+
+static unsigned long smc_move_command_queue_to_root(struct arm_smmu_device *smmu, unsigned long phys_ring_buffer_addr,
+											unsigned long prod,unsigned long cons, ssize_t size){
+	struct arm_smccc_1_2_regs smc_input = {
+		.a0 = SMC_TRANSITION_RING_BUFFER,
+		.a1 = phys_ring_buffer_addr,
+		.a2 = prod,
+		.a3 = cons,
+		.a4 = size
+	};
+	struct arm_smccc_1_2_regs smc_output;
+	arm_smccc_1_2_smc(&smc_input,&smc_output);
+	if (smc_output.a0){
+		dev_err(smmu->dev,"smc call to root failed (smc_move_command_queue_to_root)");
+	}else{
+		dev_info(smmu->dev,"smc call to root success (smc_move_command_queue_to_root)");
+	}
+	return smc_output.a0;
+}
+
 /* Probing and initialisation functions */
 static int arm_smmu_init_one_queue(struct arm_smmu_device *smmu,
 				   struct arm_smmu_queue *q,
@@ -2882,6 +3451,7 @@ static int arm_smmu_init_one_queue(struct arm_smmu_device *smmu,
 
 	do {
 		qsz = ((1 << q->llq.max_n_shift) * dwords) << 3;
+		/* allocate memory for the queue (at least one page) */
 		q->base = dmam_alloc_coherent(smmu->dev, qsz, &q->base_dma,
 					      GFP_KERNEL);
 		if (q->base || qsz < PAGE_SIZE)
@@ -2904,9 +3474,16 @@ static int arm_smmu_init_one_queue(struct arm_smmu_device *smmu,
 
 	q->prod_reg	= page + prod_off;
 	q->cons_reg	= page + cons_off;
-	q->ent_dwords	= dwords;
+	q->ent_dwords = dwords;
 
-	q->q_base  = Q_BASE_RWA;
+	dev_info(smmu->dev,"smmu linux control page; virt: %p | phys: %llx", page, virt_to_phys(page));
+	// Marker
+	if (!strcmp(name,"cmdq")){
+		dev_info(smmu->dev,"move cmdq to root: %s", name);
+		smc_move_command_queue_to_root(smmu,q->base_dma,smmu->ioaddr + prod_off ,smmu->ioaddr + cons_off,qsz);
+	}
+
+	q->q_base = Q_BASE_RWA;
 	q->q_base |= q->base_dma & Q_BASE_ADDR_MASK;
 	q->q_base |= FIELD_PREP(Q_BASE_LOG2SIZE, q->llq.max_n_shift);
 
@@ -2930,6 +3507,7 @@ static int arm_smmu_cmdq_init(struct arm_smmu_device *smmu)
 	return 0;
 }
 
+// Init of command queues
 static int arm_smmu_init_queues(struct arm_smmu_device *smmu)
 {
 	int ret;
@@ -3033,6 +3611,8 @@ static int arm_smmu_init_strtab_linear(struct arm_smmu_device *smmu)
 	struct arm_smmu_strtab_cfg *cfg = &smmu->strtab_cfg;
 
 	size = (1 << smmu->sid_bits) * (STRTAB_STE_DWORDS << 3);
+	// make sure we allocate at least one full page, so we can adjust the GPT entry in the end.
+	size = max(size, (u32)4096);
 	strtab = dmam_alloc_coherent(smmu->dev, size, &cfg->strtab_dma,
 				     GFP_KERNEL);
 	if (!strtab) {
@@ -3042,6 +3622,8 @@ static int arm_smmu_init_strtab_linear(struct arm_smmu_device *smmu)
 		return -ENOMEM;
 	}
 	cfg->strtab = strtab;
+	dev_info(smmu->dev,"allocated strtab: %p size: %x, sid_bits: %x",strtab,size,smmu->sid_bits);
+	// Move strtab pages to root (ensure they are page aligned)
 	cfg->num_l1_ents = 1 << smmu->sid_bits;
 
 	/* Configure strtab_base_cfg for a linear table covering all SIDs */
@@ -3049,6 +3631,8 @@ static int arm_smmu_init_strtab_linear(struct arm_smmu_device *smmu)
 	reg |= FIELD_PREP(STRTAB_BASE_CFG_LOG2SIZE, smmu->sid_bits);
 	cfg->strtab_base_cfg = reg;
 
+	pr_trace("smmuv3: strtab: %p | strtab_dma: %llx \n",strtab,cfg->strtab_dma);
+	//TODO must be moved to root to initalize the tables
 	arm_smmu_init_bypass_stes(strtab, cfg->num_l1_ents, false);
 	return 0;
 }
@@ -3058,10 +3642,14 @@ static int arm_smmu_init_strtab(struct arm_smmu_device *smmu)
 	u64 reg;
 	int ret;
 
-	if (smmu->features & ARM_SMMU_FEAT_2_LVL_STRTAB)
+	if (smmu->features & ARM_SMMU_FEAT_2_LVL_STRTAB){
 		ret = arm_smmu_init_strtab_2lvl(smmu);
-	else
+		dev_info(smmu->dev,"initialize level 2 stream tables");
+	}
+	else{
 		ret = arm_smmu_init_strtab_linear(smmu);
+		dev_info(smmu->dev,"initialize linear stream tables");
+	}
 
 	if (ret)
 		return ret;
@@ -3070,6 +3658,8 @@ static int arm_smmu_init_strtab(struct arm_smmu_device *smmu)
 	reg  = smmu->strtab_cfg.strtab_dma & STRTAB_BASE_ADDR_MASK;
 	reg |= STRTAB_BASE_RA;
 	smmu->strtab_cfg.strtab_base = reg;
+
+	dev_info(smmu->dev, "stream table base: %llx", reg);
 
 	/* Allocate the first VMID for stage-2 bypass STEs */
 	set_bit(0, smmu->vmid_map);
@@ -3143,6 +3733,7 @@ static void arm_smmu_write_msi_msg(struct msi_desc *desc, struct msi_msg *msg)
 	writel_relaxed(ARM_SMMU_MEMATTR_DEVICE_nGnRE, smmu->base + cfg[2]);
 }
 
+// Request MSI ids for the command queues.
 static void arm_smmu_setup_msis(struct arm_smmu_device *smmu)
 {
 	int ret, nvec = ARM_SMMU_MAX_MSIS;
@@ -3421,6 +4012,12 @@ static int arm_smmu_device_hw_probe(struct arm_smmu_device *smmu)
 	/* IDR0 */
 	reg = readl_relaxed(smmu->base + ARM_SMMU_IDR0);
 
+	// Somehow the config value is overwritten
+	// with 0x80fe6bf as some RME default
+	// Fix it to use linar stream tables.
+	// * Was the root config ... not the non-root one.
+	dev_info(smmu->dev,"smmu idr0: %x",reg);
+
 	/* 2-level structures */
 	if (FIELD_GET(IDR0_ST_LVL, reg) == IDR0_ST_LVL_2LVL)
 		smmu->features |= ARM_SMMU_FEAT_2_LVL_STRTAB;
@@ -3489,11 +4086,15 @@ static int arm_smmu_device_hw_probe(struct arm_smmu_device *smmu)
 		smmu->features |= ARM_SMMU_FEAT_STALLS;
 	}
 
-	if (reg & IDR0_S1P)
+	if (reg & IDR0_S1P){
+		dev_info(smmu->dev, "ARM_SMMU_FEAT_TRANS_S1 supported\n");
 		smmu->features |= ARM_SMMU_FEAT_TRANS_S1;
+	}
 
-	if (reg & IDR0_S2P)
+	if (reg & IDR0_S2P){
+		dev_info(smmu->dev, "ARM_SMMU_FEAT_TRANS_S2 supported\n");
 		smmu->features |= ARM_SMMU_FEAT_TRANS_S2;
+	}
 
 	if (!(reg & (IDR0_S1P | IDR0_S2P))) {
 		dev_err(smmu->dev, "no translation support!\n");
@@ -3552,6 +4153,8 @@ static int arm_smmu_device_hw_probe(struct arm_smmu_device *smmu)
 	 * If the SMMU supports fewer bits than would fill a single L2 stream
 	 * table, use a linear table instead.
 	 */
+	// set -C pci.pci_smmuv3.mmu.SMMU_IDR1=0xe739d08
+	// so we only support up to 8 sid bits
 	if (smmu->sid_bits <= STRTAB_SPLIT)
 		smmu->features &= ~ARM_SMMU_FEAT_2_LVL_STRTAB;
 
@@ -3622,6 +4225,9 @@ static int arm_smmu_device_hw_probe(struct arm_smmu_device *smmu)
 	if (arm_smmu_sva_supported(smmu))
 		smmu->features |= ARM_SMMU_FEAT_SVA;
 
+	// Disable lvl2 strtab, so we fallback to linear ones (easier to implement in EL3)
+	// This causes the STE lookup to fail
+	//smmu->features &= ~ARM_SMMU_FEAT_2_LVL_STRTAB;
 	dev_info(smmu->dev, "ias %lu-bit, oas %lu-bit (features 0x%08x)\n",
 		 smmu->ias, smmu->oas, smmu->features);
 	return 0;
@@ -3737,15 +4343,42 @@ static void arm_smmu_rmr_install_bypass_ste(struct arm_smmu_device *smmu)
 	iort_put_rmr_sids(dev_fwnode(smmu->dev), &rmr_list);
 }
 
+// Acutally there are two control pages, However the first one should be enought for now
+#define SMC_TRANSITION_CONTROL_PAGE	0xc40001c2
+
+static unsigned long smc_transition_control_page(uint64_t addr){
+	struct arm_smccc_1_2_regs smc_input = {
+		.a0 = SMC_TRANSITION_CONTROL_PAGE,
+		.a1 = addr,
+	};
+	struct arm_smccc_1_2_regs smc_output;
+	arm_smccc_1_2_smc(&smc_input,&smc_output);
+	if (smc_output.a0){
+		pr_trace("smmuv3: smc call to root failed (smc_transition_control_page)");
+	}else{
+		pr_trace("smmuv3: smc call to root success (smc_transition_control_page)");
+	}
+	return smc_output.a0;
+}
+
 static int arm_smmu_device_probe(struct platform_device *pdev)
 {
 	int irq, ret;
 	struct resource *res;
 	resource_size_t ioaddr;
 	struct arm_smmu_device *smmu;
+	struct arm_smmu_domain *smmu_domain;
 	struct device *dev = &pdev->dev;
+	void *base_addr;
+	dma_addr_t dma_handle;
 	bool bypass;
+	// custom stuff
+	void* source_virt_addr = kzalloc(4096, GFP_DMA);
+	void* target_virt_addr = kzalloc(4096, GFP_DMA);
+	size_t mapped_source = 0;
 
+
+	pr_trace("probing arm_smmu_device_probe");
 	smmu = devm_kzalloc(dev, sizeof(*smmu), GFP_KERNEL);
 	if (!smmu)
 		return -ENOMEM;
@@ -3776,6 +4409,7 @@ static int arm_smmu_device_probe(struct platform_device *pdev)
 	 * Don't map the IMPLEMENTATION DEFINED regions, since they may contain
 	 * the PMCG registers which are reserved by the PMU driver.
 	 */
+	smmu->ioaddr = ioaddr;
 	smmu->base = arm_smmu_ioremap(dev, ioaddr, ARM_SMMU_REG_SZ);
 	if (IS_ERR(smmu->base))
 		return PTR_ERR(smmu->base);
@@ -3840,6 +4474,58 @@ static int arm_smmu_device_probe(struct platform_device *pdev)
 		iommu_device_sysfs_remove(&smmu->iommu);
 		return ret;
 	}
+	// does nothing atm.
+	smc_transition_control_page(smmu->ioaddr);
+	// max kmalloc size is 4MiB
+	// we 'allocate' 256 MiB with cma before.
+	base_addr = dma_alloc_coherent(smmu->dev,100*1024*1024, &dma_handle, GFP_KERNEL);
+	//base_addr = kmalloc(4 * 1024 * 1024, GFP_DMA);
+	if (!base_addr){
+		dev_err(dev,"cannot allocate memory for s2-tables");
+	}
+	transition_s2_table_memory_to_root(dma_handle,100*1024*1024);
+	// initcall (must be only callled once)
+	// 31 is the STREAMID for the testengine and must be the same as in the driver code.
+	// Identification of s2 tables and access permissions is done by this ID.
+	dev_info(dev, "--------------------------createTestengineEntry-----------------");
+	createTestengineEntry(smmu, DEVICE_STREAM_ID);
+	dev_info(dev, "--------------------------arm_smmu_domain_alloc-----------------");
+	smmu_domain = to_smmu_domain(arm_smmu_domain_alloc(IOMMU_DOMAIN_UNMANAGED));
+	// TODO: cleanup (domain ops is probably set higher in the driver)
+	// Current workaround is to set it here or directly use pgtbl_ops.
+	smmu_domain->domain.ops = arm_smmu_ops.default_domain_ops;
+	dev_info(dev, "--------------------------arm_smmu_attach_testengine-----------------");
+	ret = arm_smmu_attach_testengine(&smmu_domain->domain,smmu,DEVICE_STREAM_ID);
+	dev_info(dev, "--------------------------testengine_initcall-----------------");
+	testengine_initcall(smmu_domain,smmu);
+	// * At this point we havent transitioned the s2 tables to root (so we can flush them on our own)
+	// reset s2 table 
+	// do the testengine call again.
+	ret = smmu_domain->pgtbl_ops->map_pages(smmu_domain->pgtbl_ops,virt_to_phys(source_virt_addr),virt_to_phys(source_virt_addr),4096,1,(IOMMU_READ | IOMMU_WRITE),GFP_DMA | __GFP_ZERO,&mapped_source);
+	if (ret){
+		dev_err(dev,"error during maping dma pages");
+	}
+	ret = smmu_domain->pgtbl_ops->map_pages(smmu_domain->pgtbl_ops,virt_to_phys(target_virt_addr),virt_to_phys(target_virt_addr),4096,1,(IOMMU_READ | IOMMU_WRITE),GFP_DMA | __GFP_ZERO,&mapped_source);
+	if (ret){
+		dev_err(dev,"error during maping dma pages");
+	}
+	// Put entry in TLB
+	testengine_copy_and_check_status(virt_to_phys(target_virt_addr),virt_to_phys(source_virt_addr), 4096, true);
+	barrier();
+	// Delete s2 table entry
+	rmm_memset(smmu_domain->s2_cfg.vttbr,0);
+	barrier();
+	// Entry should stay in TLB even if the s2 entry is deleted
+	testengine_copy_and_check_status(virt_to_phys(target_virt_addr),virt_to_phys(source_virt_addr), 4096, true);
+	barrier();
+	arm_smmu_tlb_inv_range_domain(virt_to_phys(target_virt_addr),4096,4096,true,smmu_domain);
+	arm_smmu_tlb_inv_range_domain(virt_to_phys(source_virt_addr),4096,4096,true,smmu_domain);
+	barrier();
+	// This test should fail, since we have cleared the TLB.
+	testengine_copy_and_check_status(virt_to_phys(target_virt_addr),virt_to_phys(source_virt_addr), 4096, true);
+	// reset s2 table
+	// flush tlb.
+	// do the testengine call again. 
 
 	return 0;
 }
